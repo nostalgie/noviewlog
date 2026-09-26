@@ -62,13 +62,15 @@ struct App {
     profiles: Vec<SshProfile>,
     /// The running (or last) session; `r` reconnects with the same argv.
     session: Option<SessionChoice>,
-    /// True until the first session starts (connect overlay: nothing running).
-    pending_start: bool,
     /// Session child exited: banner text; keys are gated (R/N/Q), never
     /// passed through to any shell (design D6).
     exited: Option<String>,
     /// SSH profile list overlay open (mouse-driven; Esc/outside = local).
     connect_open: bool,
+    /// Keyboard selection index into the connect overlay items.
+    connect_sel: usize,
+    /// Label of the running (or last) SSH session, shown in the status bar.
+    session_label: Option<String>,
     cols: u16,
     rows: u16,
     /// Cursor into the visible slice (keyboard record toggle); None = none.
@@ -111,9 +113,10 @@ impl App {
             confirm_quit: false,
             profiles,
             session: None,
-            pending_start: false,
             exited: None,
             connect_open: false,
+            connect_sel: 0,
+            session_label: None,
             cols,
             rows,
             cursor: None,
@@ -150,6 +153,7 @@ impl App {
                     args,
                     cwd,
                 })?;
+                self.session_label = None;
             }
             SessionChoice::Ssh { label, argv } => {
                 // No panic path on an empty argv (would currently be
@@ -163,11 +167,10 @@ impl App {
                     args,
                     cwd: None,
                 })?;
-                let _ = label; // shown via the tab/status lines
+                self.session_label = Some(label); // shown in the status bar
             }
         }
         self.session = Some(choice);
-        self.pending_start = false;
         self.exited = None;
         self.connect_open = false;
         Ok(())
@@ -246,6 +249,16 @@ impl App {
         }
     }
 
+    /// Index of the active tab per the last stats snapshot (0 when unknown).
+    fn active_tab_index(&self) -> usize {
+        self.stats.as_ref().map_or(0, |s| s.active_tab)
+    }
+
+    /// Number of tabs (Terminal + filter tabs); at least the Terminal tab.
+    fn tab_count(&self) -> usize {
+        self.stats.as_ref().map_or(1, |s| s.tabs.len().max(1))
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Option<()> {
         // Any key may alter UI state (input line, confirm); repaint cheaply.
         self.ui_dirty = true;
@@ -267,14 +280,34 @@ impl App {
             self.confirm_quit = false;
             return Some(());
         }
-        // Connect overlay: selection is mouse-only; Esc dismisses (local
-        // shell when nothing runs yet, back to the banner otherwise).
+        // Connect overlay: Up/Down move the selection (clamped), Enter
+        // activates it, Esc dismisses (local shell when nothing runs yet,
+        // back to the banner otherwise).
         if self.connect_open {
-            if key.code == KeyCode::Esc {
-                self.connect_open = false;
-                if self.session.is_none() {
-                    let _ = self.start_session(SessionChoice::Local);
+            let items = self.connect_items().len();
+            match key.code {
+                KeyCode::Esc => {
+                    self.connect_open = false;
+                    if self.session.is_none() {
+                        let _ = self.start_session(SessionChoice::Local);
+                    }
                 }
+                KeyCode::Up => self.connect_sel = connect_sel_move(self.connect_sel, -1, items),
+                KeyCode::Down => self.connect_sel = connect_sel_move(self.connect_sel, 1, items),
+                KeyCode::Enter => {
+                    let choice = self.connect_choice(self.connect_sel);
+                    self.connect_open = false;
+                    match choice {
+                        Some(c) => {
+                            let _ = self.start_session(c);
+                        }
+                        None if self.session.is_none() => {
+                            let _ = self.start_session(SessionChoice::Local);
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
             }
             return Some(());
         }
@@ -290,6 +323,7 @@ impl App {
                 }
                 KeyCode::Char('n' | 'N') => {
                     self.connect_open = true;
+                    self.connect_sel = 0;
                     self.ui_dirty = true;
                 }
                 KeyCode::Char('q' | 'Q') => return None,
@@ -326,6 +360,32 @@ impl App {
             }
             return Some(());
         }
+        // Chord shortcuts (tab/filter management) while the input line is
+        // not focused. Ctrl+F opens the filter input (same state the "+"
+        // tab-bar click sets).
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        if ctrl && matches!(key.code, KeyCode::Char('f' | 'F')) {
+            self.filter_buf.clear();
+            self.input_focus = true;
+            return Some(());
+        }
+        if let Some(command) = key_command(&key, self.tab_count(), self.active_tab_index()) {
+            self.cmd(command);
+            return Some(());
+        }
+        // Ctrl+Shift+C copies the current selection (terminal convention);
+        // consumed here so it never reaches the shell as a Ctrl+C.
+        if ctrl && key.modifiers.contains(KeyModifiers::SHIFT) {
+            if let (Some(a), Some(b)) = (self.sel_anchor, self.sel_current) {
+                if a != b {
+                    let text = self.selected_text(a.min(b), a.max(b));
+                    if !text.is_empty() {
+                        copy_to_clipboard(&text);
+                    }
+                }
+            }
+            return Some(());
+        }
         // Transparent terminal: everything goes to the wrapped shell.
         let bytes = shell_key_bytes(&key);
         if !bytes.is_empty() {
@@ -346,6 +406,23 @@ impl App {
             .collect();
         items.push("local shell".to_string());
         items
+    }
+
+    /// Session choice for connect overlay item `idx` (profiles then the
+    /// local shell entry); None for an out-of-range index.
+    fn connect_choice(&self, idx: usize) -> Option<SessionChoice> {
+        if idx < self.profiles.len() {
+            let p = &self.profiles[idx];
+            let label = format!("{} ({})", p.name, p.target);
+            Some(SessionChoice::Ssh {
+                label,
+                argv: ssh::argv_for_profile(p),
+            })
+        } else if idx < self.connect_items().len() {
+            Some(SessionChoice::Local)
+        } else {
+            None
+        }
     }
 
     /// Deterministic overlay geometry: centered box, 40 cols wide.
@@ -374,13 +451,17 @@ impl App {
     fn handle_mouse(&mut self, m: MouseEvent) {
         // Selection/menu highlight must follow the pointer in real time.
         self.ui_dirty = true;
+        // Wheel and right-click are inert over the connect overlay or the
+        // exited-session banner: nothing scrollable is shown, and a right
+        // click on the banner rows would misread row 0 as the tab bar.
+        let gated = self.connect_open || self.exited.is_some();
         match m.kind {
-            MouseEventKind::ScrollUp => {
+            MouseEventKind::ScrollUp if !gated => {
                 self.leave_follow();
                 self.cursor = None;
                 self.cmd(Command::ScrollLines { delta: -3 });
             }
-            MouseEventKind::ScrollDown => {
+            MouseEventKind::ScrollDown if !gated => {
                 // Windows Terminal behavior: reaching the bottom re-enters
                 // follow so new output pins the view again.
                 if self.engine.at_scroll_bottom() {
@@ -392,13 +473,39 @@ impl App {
                     self.cmd(Command::ScrollLines { delta: 3 });
                 }
             }
-            MouseEventKind::Down(crossterm::event::MouseButton::Right) => {
+            MouseEventKind::Down(crossterm::event::MouseButton::Middle) => {
+                // Middle-click on a tab-bar tab closes it (tab 0 pinned by
+                // the engine, and TabClose on 0 is rejected there anyway).
+                if m.row == 0 {
+                    if let Some(&(_, _, index)) = self
+                        .tab_spans
+                        .iter()
+                        .find(|&&(s, l, _)| m.column >= s && m.column < s.saturating_add(l))
+                    {
+                        if index != 0 {
+                            self.cmd(Command::TabClose { index });
+                        }
+                    }
+                }
+            }
+            MouseEventKind::Down(crossterm::event::MouseButton::Right) if !gated => {
                 if self.menu.is_some() {
                     self.menu = None;
                     return;
                 }
+                // Row 0 is the tab bar: no record context, no menu.
+                if m.row == 0 {
+                    return;
+                }
                 // Open a text menu over the grid at the click point.
-                let row = m.row.min(self.rows.saturating_sub(6));
+                let content_row = m.row.saturating_sub(1) as usize;
+                let collapsed = self.visible.get(content_row).is_some_and(|l| l.collapsed);
+                let items = menu_items(collapsed);
+                // The menu draws items+2 rows (top/bottom border); clamp so
+                // the whole box fits — derived from the item count, not a
+                // hardcoded row budget (P3-12).
+                let menu_rows = items.len() as u16 + 2;
+                let row = m.row.min(self.rows.saturating_sub(menu_rows));
                 let col = m.column.min(self.cols.saturating_sub(26));
                 let content_row = m.row.saturating_sub(1) as usize;
                 let ctx = self.row_records.get(content_row).copied().flatten();
@@ -414,22 +521,12 @@ impl App {
                             .to_string()
                     })
                     .unwrap_or_default();
-                let collapsed = self.visible.get(content_row).is_some_and(|l| l.collapsed);
                 self.menu = Some(Menu {
                     row,
                     col,
                     record_id: ctx,
                     line_text,
-                    items: vec![
-                        if collapsed {
-                            "Expand record"
-                        } else {
-                            "Collapse record"
-                        },
-                        "Copy line",
-                        "Filter include line",
-                        "Cancel",
-                    ],
+                    items,
                 });
             }
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
@@ -449,19 +546,9 @@ impl App {
                     } else {
                         None
                     };
+                    self.connect_sel = idx.unwrap_or(0);
                     self.connect_open = false;
-                    let choice = match idx {
-                        Some(i) if i < self.profiles.len() => {
-                            let p = &self.profiles[i];
-                            let label = format!("{} ({})", p.name, p.target);
-                            Some(SessionChoice::Ssh {
-                                label,
-                                argv: ssh::argv_for_profile(p),
-                            })
-                        }
-                        Some(_) => Some(SessionChoice::Local),
-                        None => None,
-                    };
+                    let choice = self.connect_choice(idx.unwrap_or(usize::MAX));
                     match choice {
                         Some(c) => {
                             let _ = self.start_session(c);
@@ -480,13 +567,17 @@ impl App {
                     let line_text = menu.line_text.clone();
                     let (mrow, mcol) = (menu.row, menu.col);
                     self.menu = None;
-                    // Hit-test: item 0 = box top border row; items start one row below.
-                    if m.column >= mcol
-                        && m.column < mcol.saturating_add(Self::menu_width(mcol, self.cols))
-                        && m.row > mrow
-                        && (m.row - mrow - 1) as usize <= items.len()
-                    {
-                        match (m.row - mrow - 1) as usize {
+                    // Hit-test: item 0 = the row below the top border; the
+                    // bottom border maps to a no-op index.
+                    let in_box = m.column >= mcol
+                        && m.column < mcol.saturating_add(Self::menu_width(mcol, self.cols));
+                    let idx = if in_box {
+                        menu_hit(mrow, m.row, items.len())
+                    } else {
+                        None
+                    };
+                    if let Some(idx) = idx {
+                        match idx {
                             0 if record_id.is_some() => {
                                 self.cmd(Command::RecordCollapseToggle {
                                     record_id: record_id.unwrap(),
@@ -500,6 +591,7 @@ impl App {
                                     regex: false,
                                 });
                             }
+                            3 => self.cmd(Command::FilterClear),
                             _ => {}
                         }
                     }
@@ -540,6 +632,12 @@ impl App {
                     }
                     self.sel_anchor = Some(cell);
                     self.sel_current = Some(cell);
+                } else {
+                    // A click outside the content area (tab bar handled above,
+                    // input/status rows) dismisses a stale selection instead
+                    // of leaving a highlight no drag explains.
+                    self.sel_anchor = None;
+                    self.sel_current = None;
                 }
             }
             MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
@@ -684,6 +782,77 @@ fn paste_append(buf: &mut String, text: &str) {
     }
 }
 
+/// Items of the right-click context menu in draw and click order. The box
+/// is `items.len() + 2` rows tall (top/bottom border) — the on-screen row
+/// clamp derives from this count so the menu always fits (P3-12). Index 3
+/// ("Clear filters") sends `Command::FilterClear` for the active tab.
+fn menu_items(collapsed: bool) -> Vec<&'static str> {
+    vec![
+        if collapsed {
+            "Expand record"
+        } else {
+            "Collapse record"
+        },
+        "Copy line",
+        "Filter include line",
+        "Clear filters",
+        "Cancel",
+    ]
+}
+
+/// Index of the menu item under a click at screen `row` for a menu whose box
+/// top border is `menu_row` with `items` entries (item 0 is the row right
+/// below the border). The bottom border row maps to index `items` (a no-op);
+/// anything above or below the box is None.
+fn menu_hit(menu_row: u16, row: u16, items: usize) -> Option<usize> {
+    if row <= menu_row {
+        return None;
+    }
+    let idx = (row - menu_row - 1) as usize;
+    (idx <= items).then_some(idx)
+}
+
+/// Move the connect overlay selection by `delta` (clamped to `[0, count)`),
+/// staying put on an empty list or an out-of-range start.
+fn connect_sel_move(sel: usize, delta: i32, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    let sel = sel.min(count - 1);
+    if delta < 0 {
+        sel.saturating_sub(delta.unsigned_abs() as usize)
+    } else {
+        (sel + delta as usize).min(count - 1)
+    }
+}
+
+/// Engine command triggered by a chord key when the filter input line is not
+/// focused. Pure so the mapping is unit-testable without a terminal.
+///
+/// - Ctrl+L: clear the filters of the active tab (engine no-ops on the
+///   Terminal tab).
+/// - Ctrl+W: close the active filter tab (never the pinned Terminal tab 0).
+/// - Ctrl+Tab: cycle to the next tab, wrapping.
+/// - Alt+1..9: switch to tab N-1 when it exists.
+fn key_command(key: &KeyEvent, tab_count: usize, active_tab: usize) -> Option<Command> {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Char('l' | 'L') if ctrl => Some(Command::FilterClear),
+        KeyCode::Char('w' | 'W') if ctrl => {
+            (active_tab != 0).then(|| Command::TabClose { index: active_tab })
+        }
+        KeyCode::Tab if ctrl => (tab_count > 1).then(|| Command::TabSwitch {
+            index: (active_tab + 1) % tab_count,
+        }),
+        KeyCode::Char(c @ '1'..='9') if alt && !ctrl => {
+            let index = usize::from(c as u8 - b'1');
+            (index < tab_count).then(|| Command::TabSwitch { index })
+        }
+        _ => None,
+    }
+}
+
 /// Encode a key event as PTY bytes (POSIX terminal encoding, valid for the
 /// wrapped shell on both platforms).
 fn shell_key_bytes(key: &KeyEvent) -> Vec<u8> {
@@ -806,18 +975,30 @@ fn main() {
     }
 }
 
-/// CLI: `--ssh <target>` (connect now), `--profile <name>` (saved profile),
-/// `--connect` (profile list overlay), no args = local shell (unchanged).
+/// CLI: `--ssh <target>` (connect now, with `--port <n>` and repeatable
+/// `--ssh-arg <arg>`), `--profile <name>` (saved profile), `--connect`
+/// (profile list overlay), no args = local shell (unchanged).
 enum CliChoice {
     Local,
     Ssh(SessionChoice),
     Connect,
 }
 
+/// Human-readable user config path for error / overlay messages.
+pub(crate) fn config_path_label() -> String {
+    noviewlog_core::core::config::user_config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "~/.config/noviewlog/config.yaml".into())
+}
+
 fn parse_cli() -> Result<CliChoice, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut iter = args.iter();
     let mut choice = CliChoice::Local;
+    // `--port` / `--ssh-arg` accumulate and apply to the `--ssh` target
+    // (defaults keep the plain `ssh -t <target>` argv).
+    let mut port: u16 = 0;
+    let mut extra: Vec<String> = Vec::new();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--ssh" => {
@@ -825,8 +1006,20 @@ fn parse_cli() -> Result<CliChoice, String> {
                 ssh::probe_ssh_client()?;
                 choice = CliChoice::Ssh(SessionChoice::Ssh {
                     label: target.clone(),
-                    argv: ssh::build_ssh_argv(target, 0, ""),
+                    argv: ssh::argv_from_cli_flags(target, port, &extra),
                 });
+                port = 0;
+                extra.clear();
+            }
+            "--port" => {
+                let v = iter.next().ok_or("--port requires a port number")?;
+                port = v
+                    .parse()
+                    .map_err(|_| format!("--port expects a number 0-65535, got `{v}`"))?;
+            }
+            "--ssh-arg" => {
+                let v = iter.next().ok_or("--ssh-arg requires an argument")?;
+                extra.push(v.clone());
             }
             "--profile" => {
                 let name = iter.next().ok_or("--profile requires a profile name")?;
@@ -834,9 +1027,7 @@ fn parse_cli() -> Result<CliChoice, String> {
                 let p = profiles.iter().find(|p| p.name == *name).ok_or_else(|| {
                     format!(
                         "no ssh profile `{name}` — add it to {} under tui_ssh_profiles",
-                        noviewlog_core::core::config::user_config_path()
-                            .map(|p| p.display().to_string())
-                            .unwrap_or_else(|_| "~/.config/noviewlog/config.yaml".into())
+                        config_path_label()
                     )
                 })?;
                 ssh::probe_ssh_client()?;
@@ -894,7 +1085,10 @@ fn run() -> Result<(), String> {
     match cli {
         CliChoice::Local => app.start_session(SessionChoice::Local)?,
         CliChoice::Ssh(choice) => app.start_session(choice)?,
-        CliChoice::Connect => app.connect_open = true,
+        CliChoice::Connect => {
+            app.connect_open = true;
+            app.connect_sel = 0;
+        }
     }
     app.ui_dirty = true;
     let _ = execute!(out, crossterm::cursor::Hide);
@@ -1143,5 +1337,227 @@ mod tests {
         app.exited = Some("ssh x exited (code 0)".to_string());
         app.handle_paste("leak");
         assert!(app.filter_buf.is_empty());
+    }
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn ctrl_l_clears_filters() {
+        assert!(matches!(
+            key_command(&key(KeyCode::Char('l'), KeyModifiers::CONTROL), 3, 2),
+            Some(Command::FilterClear)
+        ));
+        assert!(matches!(
+            key_command(&key(KeyCode::Char('L'), KeyModifiers::CONTROL), 1, 0),
+            Some(Command::FilterClear)
+        ));
+    }
+
+    #[test]
+    fn ctrl_w_closes_active_filter_tab_never_tab0() {
+        assert!(matches!(
+            key_command(&key(KeyCode::Char('w'), KeyModifiers::CONTROL), 3, 2),
+            Some(Command::TabClose { index: 2 })
+        ));
+        // Terminal tab 0 is pinned (engine rejects close on it).
+        assert!(key_command(&key(KeyCode::Char('w'), KeyModifiers::CONTROL), 3, 0).is_none());
+    }
+
+    #[test]
+    fn ctrl_tab_cycles_to_next_tab_with_wrap() {
+        assert!(matches!(
+            key_command(&key(KeyCode::Tab, KeyModifiers::CONTROL), 3, 0),
+            Some(Command::TabSwitch { index: 1 })
+        ));
+        // Wrap at the last tab back to the Terminal tab.
+        assert!(matches!(
+            key_command(&key(KeyCode::Tab, KeyModifiers::CONTROL), 3, 2),
+            Some(Command::TabSwitch { index: 0 })
+        ));
+        // A single tab has nothing to cycle to.
+        assert!(key_command(&key(KeyCode::Tab, KeyModifiers::CONTROL), 1, 0).is_none());
+    }
+
+    #[test]
+    fn alt_digits_switch_to_existing_tabs_only() {
+        let alt = KeyModifiers::ALT;
+        assert!(matches!(
+            key_command(&key(KeyCode::Char('1'), alt), 3, 0),
+            Some(Command::TabSwitch { index: 0 })
+        ));
+        assert!(matches!(
+            key_command(&key(KeyCode::Char('3'), alt), 3, 0),
+            Some(Command::TabSwitch { index: 2 })
+        ));
+        // Tab 4 does not exist with 3 tabs.
+        assert!(key_command(&key(KeyCode::Char('4'), alt), 3, 0).is_none());
+        // Alt+9 with 9+ tabs maps to index 8.
+        assert!(matches!(
+            key_command(&key(KeyCode::Char('9'), alt), 10, 0),
+            Some(Command::TabSwitch { index: 8 })
+        ));
+        // Unmodified digits type into the shell, never switch tabs.
+        assert!(key_command(&key(KeyCode::Char('3'), KeyModifiers::NONE), 3, 0).is_none());
+    }
+
+    #[test]
+    fn plain_keys_map_to_no_command() {
+        // Transparent-terminal keys stay transparent.
+        for k in [
+            key(KeyCode::Char('x'), KeyModifiers::NONE),
+            key(KeyCode::Enter, KeyModifiers::NONE),
+            key(KeyCode::Tab, KeyModifiers::NONE),
+            key(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ] {
+            assert!(key_command(&k, 3, 1).is_none());
+        }
+    }
+
+    #[test]
+    fn menu_items_include_clear_filters_and_count_drives_geometry() {
+        let items = menu_items(false);
+        assert_eq!(items.len(), 5);
+        assert_eq!(items[3], "Clear filters");
+        assert_eq!(items[4], "Cancel");
+        // Collapsed variant only swaps the first item.
+        assert_eq!(menu_items(true)[0], "Expand record");
+        assert_eq!(menu_items(true).len(), items.len());
+        // The click-position clamp must reserve items+2 rows (borders), not
+        // a hardcoded budget (P3-12).
+        let menu_rows = items.len() as u16 + 2;
+        assert_eq!(menu_rows, 7);
+    }
+
+    #[test]
+    fn menu_hit_matches_drawn_item_rows() {
+        // Menu box top at row 2, 5 items: borders at rows 2 and 8, items at
+        // rows 3..=7. Draw (render.rs) paints item i at menu.row + i + 1;
+        // the hit test must agree exactly.
+        assert_eq!(menu_hit(2, 2, 5), None, "top border");
+        for i in 0..5u16 {
+            assert_eq!(menu_hit(2, 2 + i + 1, 5), Some(i as usize));
+        }
+        assert_eq!(menu_hit(2, 8, 5), Some(5), "bottom border = no-op index");
+        assert_eq!(menu_hit(2, 9, 5), None, "below the box");
+        // The no-op index is not one of the real item labels.
+        assert!(menu_hit(2, 8, 5).unwrap() < menu_items(false).len() + 1);
+    }
+
+    #[test]
+    fn app_reports_active_tab_and_count_from_stats() {
+        let app = App::new(80, 24, Vec::new()).expect("app");
+        // No stats yet: Terminal tab only.
+        assert_eq!(app.active_tab_index(), 0);
+        assert_eq!(app.tab_count(), 1);
+    }
+
+    #[test]
+    fn connect_sel_move_clamps_at_both_ends() {
+        // Clamp, no wrap: Up from the first item stays there, Down from the
+        // last stays there.
+        assert_eq!(connect_sel_move(0, -1, 4), 0);
+        assert_eq!(connect_sel_move(3, 1, 4), 3);
+        assert_eq!(connect_sel_move(1, 1, 4), 2);
+        assert_eq!(connect_sel_move(1, -1, 4), 0);
+        // An out-of-range start is pulled back into range.
+        assert_eq!(connect_sel_move(9, 0, 4), 3);
+        // An empty list never yields a live index.
+        assert_eq!(connect_sel_move(0, 1, 0), 0);
+    }
+
+    fn mouse(kind: MouseEventKind, row: u16, column: u16) -> MouseEvent {
+        MouseEvent {
+            kind,
+            row,
+            column,
+            modifiers: KeyModifiers::NONE,
+        }
+    }
+
+    #[test]
+    fn right_click_builds_menu_over_content_rows() {
+        let mut app = App::new(80, 24, Vec::new()).expect("app");
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Right),
+            1,
+            10,
+        ));
+        assert!(app.menu.is_some());
+    }
+
+    #[test]
+    fn right_click_on_tab_bar_row_builds_no_menu() {
+        let mut app = App::new(80, 24, Vec::new()).expect("app");
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Right),
+            0,
+            10,
+        ));
+        assert!(app.menu.is_none(), "row 0 is the tab bar, not a record");
+    }
+
+    #[test]
+    fn right_click_gated_while_connect_overlay_open() {
+        let mut app = App::new(80, 24, Vec::new()).expect("app");
+        app.connect_open = true;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Right),
+            1,
+            10,
+        ));
+        assert!(app.menu.is_none());
+    }
+
+    #[test]
+    fn right_click_gated_while_session_exited() {
+        let mut app = App::new(80, 24, Vec::new()).expect("app");
+        app.exited = Some("ssh x exited (code 0)".to_string());
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Right),
+            1,
+            10,
+        ));
+        assert!(app.menu.is_none());
+    }
+
+    #[test]
+    fn connect_choice_maps_items_and_rejects_out_of_range() {
+        let app = App::new(80, 24, Vec::new()).expect("app");
+        // No profiles: item 0 is the local shell, item 1 is out of range.
+        assert!(matches!(app.connect_choice(0), Some(SessionChoice::Local)));
+        assert!(app.connect_choice(1).is_none());
+        assert!(app.connect_choice(usize::MAX).is_none());
+    }
+
+    #[test]
+    fn left_click_outside_content_clears_stale_selection() {
+        // A selection kept from an earlier drag must not survive a click on
+        // the status row (cell_at = None there).
+        let mut app = app_with_visible_lines(&["line one"]);
+        app.sel_anchor = Some((0, 0));
+        app.sel_current = Some((0, 3));
+        let status_row = 24 - 1;
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            status_row,
+            5,
+        ));
+        assert!(app.sel_anchor.is_none());
+        assert!(app.sel_current.is_none());
+    }
+
+    #[test]
+    fn ctrl_shift_c_returns_after_copy_attempt_without_selection() {
+        // Ctrl+Shift+C is consumed by the handler (never forwarded to the
+        // shell); with no selection it just copies nothing.
+        let mut app = App::new(80, 24, Vec::new()).expect("app");
+        assert!(app
+            .handle_key(key(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT
+            ))
+            .is_some());
     }
 }

@@ -68,6 +68,23 @@ Grab a build for your platform from the
 - **Windows** — unzip and run `NoViewLog.exe` (no installation required)
 - **Linux** — extract the archive and run the binary
 
+## Terminal mode (TUI)
+
+Every release also ships `noviewlog-tui`, a lightweight terminal UI for
+watching logs and SSH sessions straight from a terminal — no window needed.
+
+- Runs any local shell in a PTY-backed tab, plus saved SSH profiles
+  (`tui_ssh_profiles` in the config file)
+- Mouse wheel scrolls output; drag-select text to copy it (right-click for
+  copy/filter actions); filters are reversible — clear them with Ctrl+L
+- Filter tabs let you narrow the output without touching the original
+  stream; fully keyboard-drivable (Ctrl+F, Alt+1..9, Ctrl+Tab, Ctrl+W)
+- Static single binary, works inside any terminal, including remote SSH
+  sessions
+
+Download `noviewlog-tui` from the release assets and run it in your
+terminal (Windows Terminal recommended on Windows).
+
 ## Run from source
 
 Requires the Rust toolchain. The run scripts build on first launch, so there is

@@ -260,15 +260,19 @@ pub fn frame(
     let mut input_buf = Vec::new();
     build_row(&mut input_buf, input_row, |buf| {
         if app.input_focus {
+            // When the buffer outgrows the line, show its tail so the caret
+            // marker (`_`) always sits at the true end of the input.
+            let prefix = "filter include: ";
+            let suffix = "_  (Enter apply, Esc cancel)";
+            let body_cols = cols
+                .saturating_sub(usize::from(label_width(prefix)))
+                .saturating_sub(usize::from(label_width(suffix)));
             let _ = queue!(
                 buf,
                 SetForegroundColor(Color::DarkCyan),
-                Print(truncate(
-                    &format!(
-                        "filter include: {}_  (Enter apply, Esc cancel)",
-                        app.filter_buf
-                    ),
-                    cols
+                Print(format!(
+                    "{prefix}{}{suffix}",
+                    truncate_tail(&app.filter_buf, body_cols)
                 ))
             );
         } else if let Some(banner) = &app.exited {
@@ -290,10 +294,7 @@ pub fn frame(
             let _ = queue!(
                 buf,
                 SetForegroundColor(Color::DarkCyan),
-                Print(truncate(
-                    "select text = copy · wheel = scroll · [tab] tabs · + filter · Ctrl+Q quit",
-                    cols
-                ))
+                Print(truncate(hint_text(), cols))
             );
         }
     });
@@ -327,7 +328,7 @@ pub fn frame(
         let _ = queue!(
             buf,
             SetForegroundColor(Color::DarkGrey),
-            Print(truncate(&status, cols))
+            Print(status_line(app.session_label.as_deref(), &status, cols))
         );
     });
     rows.push(status_buf);
@@ -386,7 +387,7 @@ pub fn frame(
         let top: String = format!("+{:-<width$}+", "");
         let _ = queue!(buf, MoveTo(col, row), Print(top));
         let title = if app.profiles.is_empty() {
-            " no ssh profiles — add tui_ssh_profiles ".to_string()
+            " no ssh profiles ".to_string()
         } else {
             " connect ".to_string()
         };
@@ -398,16 +399,51 @@ pub fn frame(
             MoveTo(col, row + 1),
             Print(format!("|{title:^width$}|"))
         );
+        let sel = app.connect_sel.min(count.saturating_sub(1));
         for (idx, item) in items.iter().enumerate().take(count) {
-            let line = format!("| {:<width$} |", truncate(item, width.saturating_sub(2)));
-            let _ = queue!(buf, MoveTo(col, row + idx as u16 + 2), Print(line));
+            // The selected row paints reversed with a `>` marker; the marker
+            // replaces a pad space so the box geometry (and mouse hit test)
+            // stays identical.
+            let selected = idx == sel;
+            let marker = if selected { '>' } else { ' ' };
+            let body = format!("{marker}{}", truncate(item, width.saturating_sub(3)));
+            let line = format!("| {:<width$} |", body);
+            let _ = queue!(buf, MoveTo(col, row + idx as u16 + 2));
+            if selected {
+                let _ = queue!(
+                    buf,
+                    SetForegroundColor(Color::Black),
+                    SetBackgroundColor(Color::White),
+                    Print(line),
+                    SetForegroundColor(Color::White),
+                    SetBackgroundColor(Color::DarkBlue)
+                );
+            } else {
+                let _ = queue!(buf, Print(line));
+            }
         }
         let bottom: String = format!("+{:-<width$}+", "");
         let _ = queue!(buf, MoveTo(col, row + count as u16 + 2), Print(bottom));
+        // Empty-profile hint: the actual config path on a line below the box
+        // (not interactive — a click there is an outside click, same as Esc).
+        if app.profiles.is_empty() {
+            let body = truncate_tail(&crate::config_path_label(), width.saturating_sub(2));
+            let _ = queue!(
+                buf,
+                MoveTo(col, row + count as u16 + 3),
+                Print(format!(" {body}"))
+            );
+        }
         let _ = queue!(buf, SetBackgroundColor(Color::Reset));
         out.write_all(&buf)?;
     }
     Ok(())
+}
+
+/// Idle hint line: only shortcuts that actually exist. ASCII only, short
+/// enough for an 80-column terminal (the painter truncates cell-safely).
+fn hint_text() -> &'static str {
+    "wheel=scroll drag=copy Ctrl+F filter Ctrl+W close Alt+N tab Ctrl+Q quit"
 }
 
 fn truncate(s: &str, cols: usize) -> String {
@@ -423,6 +459,36 @@ fn truncate(s: &str, cols: usize) -> String {
         width += w;
     }
     out
+}
+
+/// Last `cols` display cells of `s` (char-boundary safe, wide-char safe).
+/// A glyph wider than the remaining budget is dropped whole, never split.
+fn truncate_tail(s: &str, cols: usize) -> String {
+    let mut picked: Vec<char> = Vec::new();
+    let mut width = 0usize;
+    for ch in s.chars().rev() {
+        let w = noviewlog_terminal::terminal::width::char_width(ch);
+        if width + w > cols {
+            break;
+        }
+        width += w;
+        picked.push(ch);
+    }
+    picked.reverse();
+    picked.into_iter().collect()
+}
+
+/// Status bar composition: an optional session label before the engine
+/// status, with the label tail-truncated so the right-side counters always
+/// stay inside `cols`.
+fn status_line(label: Option<&str>, status: &str, cols: usize) -> String {
+    let Some(label) = label.filter(|l| !l.is_empty()) else {
+        return truncate(status, cols);
+    };
+    let budget = cols
+        .saturating_sub(usize::from(label_width(status)))
+        .saturating_sub(3); // " | "
+    format!("{} | {}", truncate_tail(label, budget), status)
 }
 
 #[cfg(test)]
@@ -480,5 +546,87 @@ mod tests {
         let cut = truncate("日日日", 3);
         assert_eq!(cut, "日");
         assert!(std::str::from_utf8(cut.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn hint_line_fits_80_cols_and_is_ascii() {
+        // The hint must fit an 80-column terminal in full and degrade safely
+        // on narrower ones (cell-based truncation, ASCII source).
+        let hint = hint_text();
+        assert!(hint.is_ascii(), "hint must be ASCII: {hint:?}");
+        assert!(cells(hint) <= 80, "hint is {} cells: {hint:?}", cells(hint));
+        for width in [10usize, 40, 71, 79, 80] {
+            let cut = truncate(hint, width);
+            assert!(cells(&cut) <= width);
+        }
+        assert_eq!(truncate(hint, 80), hint);
+    }
+
+    #[test]
+    fn truncate_tail_keeps_the_last_cells() {
+        assert_eq!(truncate_tail("hello world", 5), "world");
+        // Fits: unchanged.
+        assert_eq!(truncate_tail("abc", 10), "abc");
+        // Zero budget: empty.
+        assert_eq!(truncate_tail("abc", 0), "");
+    }
+
+    #[test]
+    fn truncate_tail_is_wide_char_safe() {
+        // "日志ab" = 6 cells; last 4 cells = "志ab" (a straddling 日 is
+        // dropped whole, never split).
+        assert_eq!(truncate_tail("日志ab", 4), "志ab");
+        // Odd budget on wide glyphs: only glyphs that fully fit.
+        assert_eq!(truncate_tail("日日", 3), "日");
+    }
+
+    #[test]
+    fn filter_input_tail_shows_end_of_long_buffer() {
+        // 200-char paste on an 80-col line: the prefix, the visible tail and
+        // the caret suffix must together fit the line, and the tail must end
+        // at the true end of the buffer (the caret sits on the last char).
+        let prefix = "filter include: ";
+        let suffix = "_  (Enter apply, Esc cancel)";
+        let cols = 80usize;
+        let body_cols = cols
+            .saturating_sub(usize::from(label_width(prefix)))
+            .saturating_sub(usize::from(label_width(suffix)));
+        let buf: String = (0..200)
+            .map(|i| char::from(b'a' + (i % 26) as u8))
+            .collect();
+        let line = format!("{prefix}{}{suffix}", truncate_tail(&buf, body_cols));
+        assert!(cells(&line) <= cols, "line is {} cells", cells(&line));
+        assert!(line.starts_with(prefix));
+        assert!(line.ends_with(suffix));
+        // The tail ends with the buffer's last char, right before the caret.
+        let body = &line[prefix.len()..line.len() - suffix.len()];
+        assert_eq!(body.len(), body_cols);
+        assert!(buf.ends_with(body), "rendered body must be the buffer tail");
+        assert_eq!(body.chars().last(), buf.chars().last());
+    }
+
+    #[test]
+    fn status_line_without_label_is_plain_truncation() {
+        assert_eq!(
+            status_line(None, "running | lines 3", 80),
+            "running | lines 3"
+        );
+        // An empty label behaves like no label.
+        assert_eq!(status_line(Some(""), "running", 80), "running");
+    }
+
+    #[test]
+    fn status_line_keeps_counters_with_long_label() {
+        // A label wider than the line is tail-truncated; the engine status
+        // (with the right-side counters) must survive in full.
+        let label = "ssh very-long-profile-name-on-a-slow-host (user@host.example.com)";
+        let status = "running | lines 1234 | follow on | filters 2 | dropped 0";
+        let line = status_line(Some(label), status, 80);
+        assert!(cells(&line) <= 80, "status line is {} cells", cells(&line));
+        assert!(line.ends_with(status), "counters must be intact: {line:?}");
+        assert!(
+            line.contains(" | "),
+            "label and status joined by a separator"
+        );
     }
 }

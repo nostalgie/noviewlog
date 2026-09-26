@@ -30,6 +30,13 @@ pub fn argv_for_profile(profile: &SshProfile) -> Vec<String> {
     build_ssh_argv(&profile.target, profile.port, &profile.extra_args)
 }
 
+/// Same for the `--ssh` CLI flags: `--port <n>` and repeatable
+/// `--ssh-arg <arg>` (each one argv element). Empty defaults keep the
+/// plain `ssh -t <target>` argv.
+pub fn argv_from_cli_flags(target: &str, port: u16, extra_args: &[String]) -> Vec<String> {
+    build_ssh_argv(target, port, &extra_args.join(" "))
+}
+
 /// Verify the system ssh client exists before `Command::Start` (a missing
 /// client must be a clear error, esp. the Windows optional feature).
 pub fn probe_ssh_client() -> Result<(), String> {
@@ -76,6 +83,27 @@ mod tests {
         // IPv6 literal / odd targets must never be split.
         let argv = build_ssh_argv("user@[2001:db8::1]", 0, "");
         assert_eq!(argv.last().unwrap(), "user@[2001:db8::1]");
+    }
+
+    #[test]
+    fn cli_flags_assemble_port_and_repeatable_args() {
+        // `--ssh web01 --port 2222 --ssh-arg -J --ssh-arg bastion -4`
+        let extra: Vec<String> = ["-J", "bastion", "-4"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            argv_from_cli_flags("web01", 2222, &extra),
+            vec!["ssh", "-t", "-p", "2222", "-J", "bastion", "-4", "web01"]
+        );
+    }
+
+    #[test]
+    fn cli_flag_defaults_match_plain_target() {
+        assert_eq!(
+            argv_from_cli_flags("deploy@example.com", 0, &[]),
+            vec!["ssh", "-t", "deploy@example.com"]
+        );
     }
 
     #[test]
