@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=NoViewLog
+Comment=Native desktop log viewer
+Exec=noviewlog
+Icon=noviewlog
+Terminal=false
+Categories=Development;
+StartupWMClass=noviewlog-slint

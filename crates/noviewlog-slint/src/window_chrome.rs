@@ -143,32 +143,25 @@ pub(crate) fn install(
                 let requested = ui
                     .window()
                     .with_winit_window(|winit_window| winit_window.request_activation_token());
-                match requested {
-                    Some(Ok(serial)) => {
-                        *pending_open_url.borrow_mut() = Some(PendingOpenUrl {
-                            url: url.clone(),
-                            serial,
-                        });
-                        // Compositor may not deliver a token; still open after a short wait.
-                        let pending = pending_open_url.clone();
-                        let ui_fallback = ui.as_weak();
-                        Timer::single_shot(Duration::from_millis(200), move || {
-                            let Some(pending) = pending.borrow_mut().take() else {
-                                return;
-                            };
-                            if let Some(ui) = ui_fallback.upgrade() {
-                                report_open_url(
-                                    &ui,
-                                    &pending.url,
-                                    spawn_https_url(&pending.url, None),
-                                );
-                            } else {
-                                let _ = spawn_https_url(&pending.url, None);
-                            }
-                        });
-                        return;
-                    }
-                    Some(Err(_)) | None => {}
+                if let Some(Ok(serial)) = requested {
+                    *pending_open_url.borrow_mut() = Some(PendingOpenUrl {
+                        url: url.clone(),
+                        serial,
+                    });
+                    // Compositor may not deliver a token; still open after a short wait.
+                    let pending = pending_open_url.clone();
+                    let ui_fallback = ui.as_weak();
+                    Timer::single_shot(Duration::from_millis(200), move || {
+                        let Some(pending) = pending.borrow_mut().take() else {
+                            return;
+                        };
+                        if let Some(ui) = ui_fallback.upgrade() {
+                            report_open_url(&ui, &pending.url, spawn_https_url(&pending.url, None));
+                        } else {
+                            let _ = spawn_https_url(&pending.url, None);
+                        }
+                    });
+                    return;
                 }
             }
 

@@ -1,0 +1,28 @@
+[package]
+name = "noviewlog-wasm"
+version = "0.1.0"
+edition = "2021"
+description = "NoViewLog wasm facade — multi-session log engine over noviewlog-terminal for JS hosts"
+license = "MIT"
+repository = "https://github.com/nostalgie/noviewlog"
+publish = false
+
+[lib]
+name = "noviewlog_wasm"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+console_error_panic_hook = "0.1"
+noviewlog-terminal = { path = "../noviewlog-terminal" }
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+# Same unmaintained-upstream rename as noviewlog-core (issue #86): the ng
+# fork under the historical `serde_yaml` name keeps call sites identical.
+serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
+wasm-bindgen = "0.2"
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

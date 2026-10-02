@@ -1,0 +1,72 @@
+name: tests
+
+# Release-only CI gate. Never runs on merges: the private repo triggers it
+# manually (workflow_dispatch) on the exact SHA about to be published, and
+# scripts/publish-release.* refuse to publish without a green run on that
+# SHA. Release builds live in release.yml.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, tests)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Personal-data scan (tracked, shipped files)
+        run: scripts/check-personal-data.sh
+      - name: Install pkg-config and fontconfig (CI has no vendored .deps)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libfontconfig-dev \
+            || sudo apt-get install -y libfontconfig1-dev
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+
+  extension:
+    name: VS Code extension (vitest + wasm)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-bindgen-cli (version-locked to Cargo.lock)
+        run: cargo install wasm-bindgen-cli --version 0.2.127 --locked
+      - name: Build wasm bundle
+        run: cd extensions/vscode && npm ci && npm run build:wasm
+      - name: Run tests
+        run: cd extensions/vscode && npm test
+      - name: Compile extension
+        run: cd extensions/vscode && npm run compile
+
+  extension-vscode:
+    name: VS Code extension (headless smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - name: Install wasm-bindgen-cli (version-locked to Cargo.lock)
+        run: cargo install wasm-bindgen-cli --version 0.2.127 --locked
+      - name: Build wasm bundle and extension (test:vscode needs dist/)
+        run: cd extensions/vscode && npm ci && npm run build:wasm && npm run compile
+      - name: Install xvfb (headless VS Code)
+        run: sudo apt-get update && sudo apt-get install -y xvfb
+      - name: Run VS Code smoke suite
+        run: cd extensions/vscode && xvfb-run -a npm run test:vscode

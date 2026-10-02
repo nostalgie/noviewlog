@@ -74,6 +74,18 @@ jobs:
           cp target/release/noviewlog-slint noviewlog
           tar -czf ${{ matrix.archive }} noviewlog
 
+      # Same binary packaged as a deb (binary + desktop entry + icon). The
+      # tag provides the deb version; dry runs fall back to the script
+      # default (0.0.0-dev on shallow checkouts).
+      - name: Package (Linux .deb)
+        if: runner.os == 'Linux'
+        run: |
+          if [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            scripts/package-deb.sh "${GITHUB_REF_NAME#v}"
+          else
+            scripts/package-deb.sh
+          fi
+
       # The release itself (with curated notes) is created by the publish
       # script right after the tag push. Fall back to a bare release only so
       # the artifact is never lost; never auto-generate notes.
@@ -86,6 +98,9 @@ jobs:
           gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
             || gh release create "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" --latest --title "$GITHUB_REF_NAME"
           gh release upload "$GITHUB_REF_NAME" "${{ matrix.archive }}" --repo "$GITHUB_REPOSITORY" --clobber
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            gh release upload "$GITHUB_REF_NAME" noviewlog-linux-x64.deb --repo "$GITHUB_REPOSITORY" --clobber
+          fi
 
   # noviewlog-tui runs on remote servers over ssh, so it ships as a
   # statically linked musl binary: no glibc version requirements and no

@@ -66,9 +66,42 @@ Grab a build for your platform from the
 [Releases](../../releases) page:
 
 - **Windows** — unzip and run `NoViewLog.exe` (no installation required)
-- **Linux** — extract the archive and run the binary
+- **Linux (.deb)** — install with `sudo apt install ./noviewlog-linux-x64.deb`
+  (ships the GUI app with a desktop entry and menu icon)
+- **Linux (archive)** — extract the archive and run the binary
+
+## VS Code extension
+
+> **Status: experimental** — the extension is an early draft; expect rough
+> edges and breaking changes between releases.
+
+The `extensions/vscode` folder contains a VS Code extension that brings the
+log viewer into the editor. It runs the same parsing and filtering engine
+compiled to WebAssembly — no Electron WebView stack, and the session keeps
+running while the panel is hidden.
+
+- **NoViewLog: Run Command...** — run a command in a PTY and watch its
+  output (recent commands are remembered per workspace)
+- **NoViewLog: Open Log File...** — stream a log file, including live
+  appends; rotated (truncated) files reset the view
+
+The viewer supports filter tabs (the Terminal tab shows raw output; extra
+tabs apply include/exclude rules), severity modes, multiline record
+collapse, regex search with match navigation, follow-tail with release on
+scroll-up, and soft-wrapped line rendering. One session runs at a time;
+starting a new one replaces it.
+
+Both an editor tab and a bottom-panel view are available; they show the
+same session. Stop and Restart buttons live in the panel title bar.
+
+Building the extension from source requires Node.js and a Rust
+toolchain: `npm run build:wasm` (inside `extensions/vscode`) compiles the
+engine for wasm32 and needs `wasm-bindgen-cli` pinned to the `wasm-bindgen` version in the workspace `Cargo.lock` — the build script checks it and prints the exact `cargo install` command if it differs.
 
 ## Terminal mode (TUI)
+
+> **Status: experimental** — the TUI is an early draft; expect rough edges
+> and breaking changes between releases.
 
 Every release also ships `noviewlog-tui`, a lightweight terminal UI for
 watching logs and SSH sessions straight from a terminal — no window needed.

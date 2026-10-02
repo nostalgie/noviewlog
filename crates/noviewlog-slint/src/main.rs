@@ -42,6 +42,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ui = AppWindow::new()?;
 
+    // Wayland has no window-icon protocol: the shell matches the surface's
+    // app-id against StartupWMClass in a desktop entry. Must be set before
+    // the window is shown; no effect on Windows.
+    slint::set_xdg_app_id("noviewlog-slint")?;
+
     let tabs_model = Rc::new(VecModel::<TabInfo>::from(vec![TabInfo {
         index: 0,
         name: SharedString::from(TERMINAL_TAB_NAME),

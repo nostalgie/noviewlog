@@ -284,7 +284,7 @@ fn decode_png_rgba(png_bytes: &[u8]) -> Option<Vec<u8>> {
         }
         png::ColorType::Rgb => {
             let mut rgba = Vec::with_capacity((info.width * info.height * 4) as usize);
-            for chunk in buf[..info.buffer_size()].chunks_exact(3) {
+            for chunk in buf[..info.buffer_size()].as_chunks::<3>().0 {
                 rgba.extend_from_slice(&[chunk[0], chunk[1], chunk[2], 255]);
             }
             Some(rgba)
@@ -692,7 +692,9 @@ mod tests {
         assert!(glyph.width > 8 && glyph.height > 8);
         let colored = glyph
             .rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|p| p[3] > 20 && (p[0] > 30 || p[1] > 30 || p[2] > 30))
             .count();
         assert!(

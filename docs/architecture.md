@@ -1,10 +1,13 @@
 # Architecture
 
 NoViewLog is a native desktop log viewer. **Slint** (`noviewlog-slint`) is the
-desktop UI. The shared engine lives in `noviewlog-core`. **Linux** and
-**Windows** are equally supported; macOS and other OSes are best-effort. Daily
-build/run: `scripts/run-slint.sh` (Linux) or `scripts/run-slint-windows.ps1`
-(Windows).
+desktop UI. The shared engine lives in `noviewlog-core`, which builds on the
+GUI-free terminal layer `noviewlog-terminal`. The same terminal layer also
+hosts the other frontends: `noviewlog-tui` (terminal UI incl. SSH) and
+`noviewlog-wasm` (wasm facade behind the VS Code extension in
+`extensions/vscode/`). **Linux** and **Windows** are equally supported;
+macOS and other OSes are best-effort. Daily build/run:
+`scripts/run-slint.sh` (Linux) or `scripts/run-slint-windows.ps1` (Windows).
 
 ## Vocabulary
 
@@ -80,7 +83,10 @@ Click a collapsed preview (or disclosure cue) to toggle; View → Expand/Collaps
 | `log_view` | Per-tab filters + search + flat lines |
 | `pty` | Process I/O |
 | `viewport` + `viewport_layout` | Paint + soft-wrap / selection geometry |
-| `core/*` | Parser, filters, buffer, config, formats |
+
+Parser, filters, record buffer, formats, and the ANSI/VTE layer live in the
+separate **`noviewlog-terminal`** crate so non-Slint hosts (TUI, wasm) can
+reuse them; `noviewlog-core` composes them into sessions and views.
 
 ## Projects (high level)
 

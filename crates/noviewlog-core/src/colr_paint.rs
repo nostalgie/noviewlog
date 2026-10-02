@@ -334,7 +334,12 @@ impl OutlineBuilder for PathBuilder {
         self.push_transformed(x, y);
     }
     fn quad_to(&mut self, cx: f32, cy: f32, x: f32, y: f32) {
-        let (px, py) = *self.current.last().expect("quad without move");
+        // Malformed font data can start a contour with a curve; degrade to a
+        // move instead of panicking the render thread.
+        let Some(&(px, py)) = self.current.last() else {
+            self.move_to(x, y);
+            return;
+        };
         let (cx, cy) = self.pt(cx, cy);
         let (ex, ey) = self.pt(x, y);
         const STEPS: usize = 16;
@@ -348,7 +353,10 @@ impl OutlineBuilder for PathBuilder {
         }
     }
     fn curve_to(&mut self, cx: f32, cy: f32, dx: f32, dy: f32, x: f32, y: f32) {
-        let (px, py) = *self.current.last().expect("cubic without move");
+        let Some(&(px, py)) = self.current.last() else {
+            self.move_to(x, y);
+            return;
+        };
         let (cx, cy) = self.pt(cx, cy);
         let (dx, dy) = self.pt(dx, dy);
         let (ex, ey) = self.pt(x, y);

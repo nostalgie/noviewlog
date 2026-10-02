@@ -92,7 +92,7 @@ fn transcode_utf16_to_temp(file: &mut File, big_endian: bool) -> Result<(PathBuf
             continue;
         }
         let mut units = Vec::with_capacity(usable / 2);
-        for pair in stage[..usable].chunks_exact(2) {
+        for pair in stage[..usable].as_chunks::<2>().0 {
             units.push(if big_endian {
                 u16::from_be_bytes([pair[0], pair[1]])
             } else {

@@ -94,7 +94,7 @@ impl ViewportRenderer {
                 out.len()
             ));
         }
-        for px in out[..expected].chunks_exact_mut(4) {
+        for px in out[..expected].as_chunks_mut::<4>().0 {
             px.copy_from_slice(&BG);
         }
         let row_top = (height as f32 * 0.45 - self.metrics.ascent).max(0.0);
@@ -175,7 +175,7 @@ impl ViewportRenderer {
                 out.len()
             ));
         }
-        for px in out[..expected].chunks_exact_mut(4) {
+        for px in out[..expected].as_chunks_mut::<4>().0 {
             px.copy_from_slice(&BG);
         }
 
@@ -829,7 +829,9 @@ mod tests {
             .unwrap();
         // Active match uses orange highlight (R > G, B low).
         let orange_pixels = buf
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|px| px[0] > 150 && px[1] > 100 && px[1] < 160 && px[2] < 40)
             .count();
         assert!(
@@ -972,7 +974,9 @@ mod tests {
                 )
                 .unwrap();
             let lit = buf
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .filter(|px| px[0] > 10 || px[1] > 10 || px[2] > 10)
                 .count();
             assert!(
@@ -1025,7 +1029,9 @@ mod tests {
             .unwrap();
         // Color emoji should contribute chromatic (non-gray) pixels, not tofu/empty.
         let colorful = buf
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|px| {
                 let [r, g, b, _] = [px[0], px[1], px[2], px[3]];
                 let max = r.max(g).max(b);
@@ -1082,7 +1088,9 @@ mod tests {
             )
             .unwrap();
         let colorful = buf
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|px| {
                 let [r, g, b, _] = [px[0], px[1], px[2], px[3]];
                 let max = r.max(g).max(b);
@@ -1141,7 +1149,9 @@ mod tests {
             )
             .unwrap();
         let lit = buf
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|px| px[0] > 10 || px[1] > 10 || px[2] > 10)
             .count();
         assert_eq!(
@@ -1502,7 +1512,9 @@ mod tests {
             .unwrap();
 
         let orange_pixels = buf
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|px| px[0] > 150 && px[1] > 100 && px[1] < 160 && px[2] < 40)
             .count();
         assert!(
@@ -1511,7 +1523,9 @@ mod tests {
         );
 
         let text_pixels = buf
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|px| {
                 // Default foreground (not black background, not orange highlight)
                 px[0] > 180 && px[1] > 200 && px[2] > 200
@@ -1690,7 +1704,9 @@ mod tests {
             .unwrap();
 
         let lit = buf
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|px| px[0] > 10 || px[1] > 10 || px[2] > 10)
             .count();
         assert!(
@@ -1730,7 +1746,9 @@ mod tests {
             )
             .unwrap();
         let lit_border = buf2
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|px| px[0] > 10 || px[1] > 10 || px[2] > 10)
             .count();
         assert!(
@@ -1753,7 +1771,9 @@ mod tests {
         let start = (y * width * 4) as usize;
         let end = start + (width as usize) * 4;
         buf[start..end]
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|px| px[0] > 10 || px[1] > 10 || px[2] > 10)
             .count()
     }

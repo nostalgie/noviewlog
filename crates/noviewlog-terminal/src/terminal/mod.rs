@@ -52,6 +52,10 @@ pub struct TerminalEmulator {
     cursor_row: usize,
     cursor_col: usize,
     cursor_visible: bool,
+    /// The app requested mouse events (DECSET 1000/1002/1003).
+    mouse_tracking: bool,
+    /// The app requested bracketed paste (DECSET 2004).
+    bracketed_paste: bool,
     pen: Pen,
     /// Pending auto-wrap: next print wraps first (DEC autowrap).
     wrap_pending: bool,
@@ -80,6 +84,8 @@ impl TerminalEmulator {
             cursor_row: 0,
             cursor_col: 0,
             cursor_visible: true,
+            mouse_tracking: false,
+            bracketed_paste: false,
             pen: Pen::default(),
             wrap_pending: false,
             committed: Vec::new(),
@@ -107,6 +113,14 @@ impl TerminalEmulator {
 
     pub fn cursor_visible(&self) -> bool {
         self.cursor_visible
+    }
+
+    pub fn mouse_tracking(&self) -> bool {
+        self.mouse_tracking
+    }
+
+    pub fn bracketed_paste(&self) -> bool {
+        self.bracketed_paste
     }
 
     /// Map the grid cursor into the logical screen-line coordinate system
@@ -190,15 +204,22 @@ impl Perform for TerminalEmulator {
                 self.apply_sgr(&codes);
             }
             'h' if private => {
-                if first_param(params) == 25 {
-                    self.cursor_visible = true;
+                match first_param(params) {
+                    25 => self.cursor_visible = true,
+                    // Mouse tracking: normal (1000) and button-event (1002)
+                    // both mean the app wants mouse events; 1006 only
+                    // switches the encoding, SGR is assumed.
+                    1000 | 1002 | 1003 => self.mouse_tracking = true,
+                    2004 => self.bracketed_paste = true,
+                    _ => {}
                 }
             }
-            'l' if private => {
-                if first_param(params) == 25 {
-                    self.cursor_visible = false;
-                }
-            }
+            'l' if private => match first_param(params) {
+                25 => self.cursor_visible = false,
+                1000 | 1002 | 1003 => self.mouse_tracking = false,
+                2004 => self.bracketed_paste = false,
+                _ => {}
+            },
             'A' => {
                 let n = first_param(params).max(1) as usize;
                 self.cursor_row = self.cursor_row.saturating_sub(n);
@@ -517,6 +538,16 @@ impl TerminalIngest {
 
     pub fn size(&self) -> (usize, usize) {
         (self.emu.cols(), self.emu.rows())
+    }
+
+    /// The hosted app requested mouse events (DECSET 1000/1002/1003).
+    pub fn mouse_tracking(&self) -> bool {
+        self.emu.mouse_tracking()
+    }
+
+    /// The hosted app requested bracketed paste (DECSET 2004).
+    pub fn bracketed_paste(&self) -> bool {
+        self.emu.bracketed_paste()
     }
 
     /// Current VT screen as painted lines (Follow live grid), including the

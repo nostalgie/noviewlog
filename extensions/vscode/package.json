@@ -1,0 +1,143 @@
+{
+  "name": "noviewlog-vscode",
+  "displayName": "NoViewLog",
+  "description": "Log viewer sessions: run a command or open a log file and browse it with filters, severity levels, multiline collapse, and regex search.",
+  "version": "0.1.0",
+  "publisher": "noviewlog",
+  "license": "MIT",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "noviewlog.runCommand",
+        "title": "Run Command...",
+        "category": "NoViewLog"
+      },
+      {
+        "command": "noviewlog.openLogFile",
+        "title": "Open Log File...",
+        "category": "NoViewLog"
+      },
+      {
+        "command": "noviewlog.openFileHere",
+        "title": "Open in NoViewLog",
+        "category": "NoViewLog"
+      },
+      {
+        "command": "noviewlog.stop",
+        "title": "Stop Session",
+        "category": "NoViewLog",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "noviewlog.restart",
+        "title": "Restart Session",
+        "category": "NoViewLog",
+        "icon": "$(debug-restart)"
+      }
+    ],
+    "viewsContainers": {
+      "panel": [
+        {
+          "id": "noviewlog",
+          "title": "NoViewLog",
+          "icon": "$(output)"
+        }
+      ]
+    },
+    "views": {
+      "noviewlog": [
+        {
+          "type": "webview",
+          "id": "noviewlog.session",
+          "name": "Session"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "noviewlog.restart",
+          "group": "navigation@1",
+          "when": "noviewlog.sessionActive"
+        },
+        {
+          "command": "noviewlog.stop",
+          "group": "navigation@2",
+          "when": "noviewlog.sessionActive"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "noviewlog.openFileHere",
+          "when": "resourceExtname in noviewlog.logExtensions",
+          "group": "noviewlog@1"
+        }
+      ],
+      "editor/title/context": [
+        {
+          "command": "noviewlog.openFileHere",
+          "when": "resourceExtname in noviewlog.logExtensions",
+          "group": "noviewlog@1"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "NoViewLog",
+      "properties": {
+        "noviewlog.logExtensions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            ".log",
+            ".txt"
+          ],
+          "description": "File extensions that get the 'Open in NoViewLog' context-menu entry."
+        },
+        "noviewlog.maxScrollbackLines": {
+          "type": "number",
+          "default": 10000,
+          "minimum": 100,
+          "description": "Maximum number of records kept in the session buffer (oldest are dropped)."
+        },
+        "noviewlog.autoStart": {
+          "type": "boolean",
+          "default": true,
+          "description": "Start an interactive shell automatically when the NoViewLog surface is first shown and no session is active."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "compile": "node esbuild.mjs",
+    "watch": "node esbuild.mjs --watch",
+    "test": "vitest run",
+    "build:wasm": "node scripts/check-wasm-bindgen.mjs && cargo build -p noviewlog-wasm --target wasm32-unknown-unknown --release && wasm-bindgen --target nodejs --out-dir dist/wasm ../../target/wasm32-unknown-unknown/release/noviewlog_wasm.wasm",
+    "package": "vsce package",
+    "test:vscode": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/test-cli": "^0.0.15",
+    "@vscode/test-electron": "^3.1.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.24.0",
+    "jsdom": "^30.1.1",
+    "typescript": "^5.6.0",
+    "vitest": "^2.1.0"
+  },
+  "dependencies": {
+    "@lydell/node-pty": "^1.2.0-beta.15"
+  }
+}

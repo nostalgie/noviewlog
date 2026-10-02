@@ -17,7 +17,7 @@ const VIEWPORT_PLACEHOLDER_RGBA: [u8; 4] = [0x0d, 0x11, 0x17, 0xff];
 
 pub(crate) fn seed_opaque_viewport(ui: &AppWindow) {
     let mut buffer = SharedPixelBuffer::<Rgba8Pixel>::new(8, 8);
-    for px in buffer.make_mut_bytes().chunks_exact_mut(4) {
+    for px in buffer.make_mut_bytes().as_chunks_mut::<4>().0 {
         px.copy_from_slice(&VIEWPORT_PLACEHOLDER_RGBA);
     }
     ui.set_viewport_image(Image::from_rgba8(buffer));

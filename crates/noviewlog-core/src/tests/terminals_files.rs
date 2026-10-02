@@ -729,7 +729,9 @@ fn file_scrollbar_mid_jump_loads_window_not_black() {
     let mut rgba = vec![0u8; 800 * 400 * 4];
     engine.render(800, 400, &mut rgba).expect("render");
     let lit = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|px| px[0] | px[1] | px[2] > 0x20)
         .count();
     assert!(
@@ -816,7 +818,9 @@ fn file_scrollbar_reaches_eof() {
     let mut rgba = vec![0u8; 800 * 400 * 4];
     engine.render(800, 400, &mut rgba).expect("render");
     let lit = rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .filter(|px| px[0] | px[1] | px[2] > 0x20)
         .count();
     assert!(lit > 200, "EOF paint must show content lit={lit}");
