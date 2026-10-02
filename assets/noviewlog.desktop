@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=NoViewLog
+GenericName=Log viewer
+Comment=Desktop log filter
+Exec=noviewlog-slint %F
+Icon=noviewlog
+Terminal=false
+Categories=Development;Utility;
+StartupWMClass=noviewlog-slint

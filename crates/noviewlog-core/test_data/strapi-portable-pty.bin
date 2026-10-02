@@ -1,0 +1,38 @@
+
+> my-strapi-project@0.1.0 develop
+> strapi develop
+
+(node:246023) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+[?25l[36m⠋[39m Cleaning dist dir /home/user/projects/my-app/dist[2K[1G[?25h[32m✔[39m Cleaning dist dir (6ms)
+(node:246161) Warning: The 'NO_COLOR' env is ignored due to the 'FORCE_COLOR' env being set.
+(Use `node --trace-warnings ...` to show where the warning was created)
+[?25l[36m⠋[39m Loading Strapi[2K[1G[36m⠙[39m Loading Strapi[2K[1G[36m⠹[39m Loading Strapi[2026-07-10 12:48:26.332] [33mwarn[39m: [email]: The "sendmail" email provider is still supported, but for most production setups that use a dedicated SMTP relay, consider switching to @strapi/provider-email-nodemailer (set `provider` to `"nodemailer"` in your email plugin config). This message is only shown in non-production environments.
+[?25l[36m⠋[39m Building build context[2K[1G[36m⠸[39m Loading Strapi[2K[1G[?25h[32m✔[39m Building build context (55ms)
+[?25l[36m⠋[39m Creating admin[2K[1G[36m⠼[39m Loading Strapi[2K[1G[36m⠙[39m Creating admin[33mThe CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.[39m
+[2K[1G[36m⠴[39m Loading Strapi[2K[1G[36m⠹[39m Creating admin[2K[1G[?25h[32m✔[39m Creating admin (227ms)
+[2K[1G[?25h[32m✔[39m Loading Strapi (975ms)
+[?25l[36m⠋[39m Generating types[2K[1G[36m⠙[39m Generating types[2K[1G[?25h[32m✔[39m Generating types (191ms)
+[?25l[36m⠋[39m Compiling TS[?25l[36m⠋[39m Cleaning dist dir /home/user/projects/my-app/dist[2K[1G[?25h[32m✔[39m Cleaning dist dir (12ms)
+[2K[1G[?25h[32m✔[39m Compiling TS (1203ms)
+
+[30m[47m Project information                                                          [49m[39m
+
+[90m╭────────────────────[39m[90m┬──────────────────────────────────────────────────╮[39m
+[90m│[39m [34mTime[39m               [90m│[39m Fri Jul 10 2026 12:48:28 GMT+0300 (Moscow Stand… [90m│[39m
+[90m│[39m [34mLaunched in[39m        [90m│[39m 2382 ms                                          [90m│[39m
+[90m│[39m [34mEnvironment[39m        [90m│[39m development                                      [90m│[39m
+[90m│[39m [34mProcess PID[39m        [90m│[39m 246161                                           [90m│[39m
+[90m│[39m [34mVersion[39m            [90m│[39m 5.50.1 (node v24.16.0)                           [90m│[39m
+[90m│[39m [34mEdition[39m            [90m│[39m Community                                        [90m│[39m
+[90m│[39m [34mDatabase[39m           [90m│[39m sqlite                                           [90m│[39m
+[90m│[39m [34mDatabase name[39m      [90m│[39m .tmp/data.db                                     [90m│[39m
+[90m╰────────────────────[39m[90m┴──────────────────────────────────────────────────╯[39m
+
+[30m[47m Actions available                                                            [49m[39m
+
+[1mWelcome back![22m
+[90mTo access the server ⚡️, go to:[39m
+[1mhttp://localhost:1337[22m
+
+[2026-07-10 12:48:28.142] [32minfo[39m: Strapi started successfully

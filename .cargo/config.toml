@@ -1,0 +1,7 @@
+# Linux fontconfig bits from scripts/setup-slint-deps.sh.
+# Keep PKG_CONFIG_PATH / LIBRARY_PATH here (not in run-slint.sh): process-env
+# rustflags and pkg-config paths change Cargo fingerprints and force a full
+# rebuild when alternating the script with a plain `cargo build`.
+[env]
+PKG_CONFIG_PATH = { value = "../.deps/pkgconfig", relative = true, force = false }
+LIBRARY_PATH = { value = "../.deps/lib", relative = true, force = false }

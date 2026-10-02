@@ -1,0 +1,71 @@
+// App chrome colors. Dark is the active scheme; light slots are reserved for later.
+// In-bar chrome menus use Theme + Palette; fluent style still styles other std widgets.
+
+import { Palette } from "std-widgets.slint";
+
+export global Theme {
+    // Single switch for future light mode (menus follow Palette.color-scheme).
+    out property <bool> is-dark: Palette.color-scheme != ColorScheme.light;
+
+    out property <color> bg-window: #0d1117;
+    out property <color> bg-panel: #161b22;
+    out property <color> bg-bar: #1c222b;
+    out property <color> bg-input: #21262d;
+    out property <color> bg-input-hover: #2a313c;
+    out property <color> bg-input-active: #30363d;
+    out property <color> border: #30363d;
+    out property <color> border-subtle: #21262d;
+    // Window outline — tweak this color (1px CSD edge on no-frame windows).
+    out property <color> window-border: #34383f;
+    out property <color> accent: #2f81f7;
+    out property <color> accent-hover: #388bfd;
+    out property <color> accent-pressed: #1f6feb;
+    out property <color> accent-soft: #182a45;
+    // Label / icon color on accent fills (primary buttons, close-hover).
+    out property <color> on-accent: #ffffff;
+    out property <color> danger: #f85149;
+    out property <color> danger-pressed: #da3633;
+    // IN / OUT filter badges + buttons.
+    out property <color> include: #3fb950;
+    out property <color> include-fill: #132e1a;
+    out property <color> exclude: #f0883e;
+    out property <color> exclude-fill: #3a2410;
+    out property <color> text-primary: #e6edf3;
+    out property <color> text-secondary: #8b949e;
+    out property <color> text-muted: #6e7681;
+
+    // Spacing / radius / chrome geometry tokens.
+    out property <length> space-xs: 2px;
+    out property <length> space-sm: 4px;
+    out property <length> space-md: 8px;
+    out property <length> space-lg: 12px;
+    out property <length> space-xl: 16px;
+    // Dialog / form TextInput inset (match Settings SpinBox: even L/T/R inside the box).
+    out property <length> field-height: 32px;
+    out property <length> field-pad-x: 10px;
+    out property <length> field-pad-y: 8px;
+    out property <length> radius-sm: 4px;
+    out property <length> radius-md: 6px;
+    out property <length> title-strip: 32px;
+    out property <length> resize-border: 2px;
+    // Centered File/dialog overlays (Projects, Edit launch, Settings, About).
+    out property <length> overlay-width: 460px;
+    out property <color> shadow-menu: #00000042;
+    out property <color> shadow-panel: #00000055;
+
+    // TextInput caret selection (not chrome borders / row tints).
+    // Distinct from accent-soft so selected glyphs stay visible on dark fields.
+    out property <color> selection-bg: #388bfd;
+    out property <color> selection-fg: #ffffff;
+
+    // Inline rename (TabChip + TerminalRow). Tweak here — both fields read these.
+    // rename-border defaults to text-muted so the outline stays visible on accent-soft.
+    out property <color> rename-bg: #21262d;
+    out property <color> rename-border: #6e7681;
+    out property <length> rename-border-width: 1px;
+    out property <length> rename-radius: 0px;
+    out property <color> rename-text: #e6edf3;
+    out property <length> rename-pad: 4px;
+    out property <length> rename-tab-height: 32px;
+    out property <length> rename-terminal-height: 24px;
+}

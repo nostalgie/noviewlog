@@ -1,0 +1,41 @@
+
+> my-strapi-project@0.1.0 develop
+> strapi develop
+
+- Cleaning dist dir /home/user/projects/my-app/dist
+✔ Cleaning dist dir (4ms)
+- Loading Strapi
+[2026-07-10 11:05:28.684] [33mwarn[39m: [email]: The "sendmail" email provider is still supported, but for most production setups that use a dedicated SMTP relay, consider switching to @strapi/provider-email-nodemailer (set `provider` to `"nodemailer"` in your email plugin config). This message is only shown in non-production environments.
+- Building build context
+✔ Building build context (55ms)
+- Creating admin
+[33mThe CJS build of Vite's Node API is deprecated. See https://vite.dev/guide/troubleshooting.html#vite-cjs-node-api-deprecated for more details.[39m
+✔ Creating admin (213ms)
+✔ Loading Strapi (955ms)
+- Generating types
+✔ Generating types (158ms)
+- Compiling TS
+- Cleaning dist dir /home/user/projects/my-app/dist
+✔ Cleaning dist dir (10ms)
+✔ Compiling TS (1241ms)
+
+ Project information
+
+╭────────────────────┬──────────────────────────────────────────────────╮
+│ Time               │ Fri Jul 10 2026 11:05:30 GMT+0300 (Moscow Stand… │
+│ Launched in        │ 2366 ms                                          │
+│ Environment        │ development                                      │
+│ Process PID        │ 106978                                           │
+│ Version            │ 5.50.1 (node v24.16.0)                           │
+│ Edition            │ Community                                        │
+│ Database           │ sqlite                                           │
+│ Database name      │ .tmp/data.db                                     │
+╰────────────────────┴──────────────────────────────────────────────────╯
+
+ Actions available
+
+Welcome back!
+To access the server ⚡️, go to:
+http://localhost:1337
+
+[2026-07-10 11:05:30.481] [32minfo[39m: Strapi started successfully

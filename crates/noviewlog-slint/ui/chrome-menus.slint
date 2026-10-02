@@ -1,0 +1,583 @@
+// Title-bar / context chrome menus and related toggle chips.
+// Do not import app.slint (circular import / Slint preferred-size cycles).
+
+import { Theme } from "theme.slint";
+
+// Fluent-like context-menu row: title left, muted accelerator right.
+// MenuItem.shortcut is MenuBar-only in Slint 1.17, so viewport uses this layout.
+export component CtxAccelMenuItem inherits TouchArea {
+    in property <string> title;
+    in property <string> accelerator;
+    in property <bool> item-enabled: true;
+    callback activated();
+
+    enabled: true;
+    // Fixed row height — preferred-height alone collapses inside PopupWindow.
+    height: Theme.title-strip;
+    vertical-stretch: 0;
+    // Context menu rows use Arrow cursor (not Hand).
+    mouse-cursor: default;
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: 0px;
+        background: root.has-hover && root.item-enabled ? Theme.accent-soft : transparent;
+
+        HorizontalLayout {
+            // Dense gnome-terminal-like padding (no icon gutter).
+            // Menu item left padding — tweak here
+            padding-left: 4px;
+            padding-right: 8px;
+            spacing: 12px;
+
+            Text {
+                text: root.title;
+                // Menu font size — tweak here
+                font-size: 12px;
+                color: Theme.text-primary;
+                vertical-alignment: center;
+                opacity: root.item-enabled ? 1.0 : 0.5;
+                horizontal-stretch: 1;
+            }
+
+            Text {
+                text: root.accelerator;
+                // Menu font size — tweak here (accelerator)
+                font-size: 12px;
+                color: Theme.text-secondary;
+                vertical-alignment: center;
+                horizontal-alignment: right;
+                opacity: root.item-enabled ? 1.0 : 0.5;
+            }
+        }
+    }
+
+    clicked => {
+        if (root.item-enabled) {
+            root.activated();
+        }
+    }
+}
+
+// Compact toggle chip (FILTERS `.*` / find Aa|ab|.*).
+export component ModeToggle inherits TouchArea {
+    in property <string> label;
+    in property <string> tip;
+    in-out property <bool> active: false;
+    in property <length> chip-width: 22px;
+    callback toggled(active: bool);
+
+    width: root.chip-width;
+    height: 22px;
+    mouse-cursor: pointer;
+    vertical-stretch: 0;
+    clicked => {
+        root.active = !root.active;
+        root.toggled(root.active);
+    }
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: 0px;
+        background: root.active
+            ? Theme.accent-soft
+            : (parent.has-hover ? Theme.bg-input-hover : transparent);
+        // Selection = fill only — never Theme.accent outline.
+        border-width: 0px;
+
+        Text {
+            width: 100%;
+            height: 100%;
+            text: root.label;
+            color: root.active ? Theme.accent : Theme.text-secondary;
+            font-size: 11px;
+            font-weight: 700;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+}
+
+// Caption buttons — min / max / close on the client title strip.
+// Icons are Path geometry (not Unicode): Windows UI fonts often lack ✕/❐/─
+// and show tofu / misaligned glyphs; Paths look the same on Win and Linux.
+export component CaptionButton inherits Rectangle {
+    // "minimize" | "maximize" | "restore" | "close"
+    in property <string> kind;
+    callback clicked();
+
+    property <bool> is-close: root.kind == "close";
+    property <color> icon-color: ta.has-hover && root.is-close ? Theme.on-accent : Theme.text-secondary;
+
+    width: 46px;
+    height: Theme.title-strip;
+    background: ta.pressed
+        ? (root.is-close ? Theme.danger-pressed : Theme.bg-input-active)
+        : ta.has-hover
+            ? (root.is-close ? Theme.danger : Theme.bg-input-hover)
+            : transparent;
+
+    ta := TouchArea {
+        width: 100%;
+        height: 100%;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    // 10×10 icon box, optically centered in the 46×32 caption hit target.
+    icon := Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: (parent.height - self.height) / 2;
+        width: 10px;
+        height: 10px;
+        background: transparent;
+
+        if root.kind == "minimize": Path {
+            width: 100%;
+            height: 100%;
+            stroke: root.icon-color;
+            stroke-width: 1px;
+            viewbox-x: 0;
+            viewbox-y: 0;
+            viewbox-width: 10;
+            viewbox-height: 10;
+            commands: "M 0 5 L 10 5";
+        }
+
+        if root.kind == "maximize": Path {
+            width: 100%;
+            height: 100%;
+            stroke: root.icon-color;
+            stroke-width: 1px;
+            fill: transparent;
+            viewbox-x: 0;
+            viewbox-y: 0;
+            viewbox-width: 10;
+            viewbox-height: 10;
+            commands: "M 0.5 0.5 H 9.5 V 9.5 H 0.5 Z";
+        }
+
+        if root.kind == "restore": Path {
+            width: 100%;
+            height: 100%;
+            stroke: root.icon-color;
+            stroke-width: 1px;
+            fill: transparent;
+            viewbox-x: 0;
+            viewbox-y: 0;
+            viewbox-width: 10;
+            viewbox-height: 10;
+            // Overlapping squares (restore-down), classic caption motif.
+            commands: "M 2.5 0.5 H 9.5 V 7.5 H 7.5 M 0.5 2.5 H 7.5 V 9.5 H 0.5 Z";
+        }
+
+        if root.kind == "close": Path {
+            width: 100%;
+            height: 100%;
+            stroke: root.icon-color;
+            stroke-width: 1.25px;
+            viewbox-x: 0;
+            viewbox-y: 0;
+            viewbox-width: 10;
+            viewbox-height: 10;
+            commands: "M 1 1 L 9 9 M 9 1 L 1 9";
+        }
+    }
+}
+
+// Compact Follow / WRAP chips in the CSD caption cluster (left of minimize).
+export component TitleBarToggleChip inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    callback clicked();
+
+    height: Theme.title-strip;
+    border-radius: 4px;
+    background: root.active
+        ? (ta.pressed ? Theme.bg-input-active : Theme.accent-soft)
+        : (ta.pressed
+            ? Theme.bg-input-active
+            : ta.has-hover ? Theme.bg-input-hover : transparent);
+
+    HorizontalLayout {
+        height: 100%;
+        padding-left: 8px;
+        padding-right: 8px;
+        alignment: center;
+
+        Text {
+            text: root.label;
+            color: root.active || ta.has-hover ? Theme.text-primary : Theme.text-secondary;
+            font-size: 11px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    ta := TouchArea {
+        width: 100%;
+        height: 100%;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+}
+
+// Caption-cluster chip that opens a PopupWindow dropdown (e.g. severity filter).
+// Visual match for TitleBarToggleChip; @children hold the PopupWindow.
+export component TitleBarDropdownChip inherits Rectangle {
+    in property <string> label;
+    in property <bool> active: false;
+    in property <bool> open: false;
+    callback clicked();
+
+    height: Theme.title-strip;
+    border-radius: 4px;
+    background: root.open || root.active
+        ? (ta.pressed ? Theme.bg-input-active : Theme.accent-soft)
+        : (ta.pressed
+            ? Theme.bg-input-active
+            : ta.has-hover ? Theme.bg-input-hover : transparent);
+
+    HorizontalLayout {
+        height: 100%;
+        padding-left: 8px;
+        padding-right: 6px;
+        spacing: 4px;
+        alignment: center;
+
+        Text {
+            text: root.label;
+            color: root.open || root.active || ta.has-hover ? Theme.text-primary : Theme.text-secondary;
+            font-size: 11px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+
+        // Small Path chevron (never Unicode ▾).
+        VerticalLayout {
+            horizontal-stretch: 0;
+            alignment: center;
+            Path {
+                width: 8px;
+                height: 8px;
+                fill: root.open || root.active || ta.has-hover ? Theme.text-secondary : Theme.text-muted;
+                stroke-width: 0px;
+                viewbox-x: 0;
+                viewbox-y: 0;
+                viewbox-width: 10;
+                viewbox-height: 10;
+                commands: "M 1 3 L 9 3 L 5 8 Z";
+            }
+        }
+    }
+
+    ta := TouchArea {
+        width: 100%;
+        height: 100%;
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+
+    @children
+}
+
+// Title-bar menu opener (File / View / Tab) — not native MenuBar.
+// Armed hover-switch does NOT use has-hover: open PopupWindow (WindowKind::Popup)
+// blocks move/hover on the main window. AppWindow.menu-bar-pointer-moved (from
+// winit CursorMoved) hit-tests these buttons instead.
+export component TitleBarMenuButton inherits Rectangle {
+    in property <string> label;
+    in property <bool> open: false;
+    callback clicked();
+
+    // Full CSD strip height so labels are easy to hit (resize-border is kept small).
+    height: Theme.title-strip;
+    // Square hover/open highlight — flat menubar chrome.
+    border-radius: 0px;
+    background: ta.has-hover || root.open ? Theme.bg-input-hover : transparent;
+
+    // Intrinsic width = label + side padding; height fills the 32px strip.
+    // VerticalLayout alignment:center optically centers like Cursor's menubar
+    // (avoid a short HorizontalLayout that top-packs the Text).
+    VerticalLayout {
+        height: 100%;
+        padding-left: 8px;
+        padding-right: 8px;
+        alignment: center;
+
+        Text {
+            text: root.label;
+            color: Theme.text-primary;
+            font-size: 12px;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+        }
+    }
+
+    ta := TouchArea {
+        width: 100%;
+        height: 100%;
+        mouse-cursor: default;
+        clicked => { root.clicked(); }
+    }
+
+    // PopupWindow dropdowns / flyouts (do not participate in layout).
+    @children
+}
+
+// Dropdown / flyout row for in-bar chrome menus (no accelerators).
+// Rectangle + child TouchArea (same pattern as TitleBarMenuButton): full-row hit
+// target; hover fill on the root so it cannot be obscured by layout children.
+export component ChromeMenuItem inherits Rectangle {
+    in property <string> title;
+    in property <bool> item-enabled: true;
+    in property <bool> checkable: false;
+    in property <bool> checked: false;
+    in property <bool> has-submenu: false;
+    // Open submenu trigger / sticky highlight (not just pointer hover).
+    in property <bool> active: false;
+    callback activated();
+
+    // Forward for ChromeSubmenu hover-switch (`changed has-hover`).
+    out property <bool> has-hover: ta.has-hover;
+
+    // Fixed row height — preferred-size alone can collapse menu rows in popups.
+    height: Theme.title-strip;
+    width: 100%;
+    vertical-stretch: 0;
+    border-radius: 0px;
+    // Selected menu row: bg-input-hover (not accent-soft). Fluent
+    // Palette.background (#1C1C1C) is nearly invisible.
+    background: (ta.has-hover || root.active) && root.item-enabled
+        ? Theme.bg-input-hover
+        : transparent;
+
+    HorizontalLayout {
+        width: 100%;
+        height: 100%;
+        // Menu item left padding — tweak here
+        padding-left: 4px;
+        padding-right: 8px;
+        // Gap between check column and title — also affects title left inset
+        spacing: 6px;
+
+        // Checkmark / indent gutter — Path when checked (never Unicode ✓).
+        Rectangle {
+            width: 12px;
+            height: 100%;
+            horizontal-stretch: 0;
+            background: transparent;
+
+            if root.checkable && root.checked: Path {
+                x: (parent.width - 10px) / 2;
+                y: (parent.height - 10px) / 2;
+                width: 10px;
+                height: 10px;
+                stroke: Theme.text-primary;
+                stroke-width: 1.25px;
+                fill: transparent;
+                viewbox-x: 0;
+                viewbox-y: 0;
+                viewbox-width: 10;
+                viewbox-height: 10;
+                commands: "M 1.5 5 L 4 7.5 L 8.5 2.5";
+                opacity: root.item-enabled ? 1.0 : 0.5;
+            }
+        }
+
+        Text {
+            text: root.title;
+            // Menu font size — tweak here
+            font-size: 12px;
+            color: Theme.text-primary;
+            vertical-alignment: center;
+            opacity: root.item-enabled ? 1.0 : 0.5;
+            horizontal-stretch: 1;
+        }
+
+        if root.has-submenu: VerticalLayout {
+            horizontal-stretch: 0;
+            alignment: center;
+            // Path chevron — never Unicode ›.
+            Path {
+                width: 8px;
+                height: 8px;
+                fill: Theme.text-secondary;
+                stroke-width: 0px;
+                viewbox-x: 0;
+                viewbox-y: 0;
+                viewbox-width: 10;
+                viewbox-height: 10;
+                commands: "M 3 1 L 8 5 L 3 9 Z";
+                opacity: root.item-enabled ? 1.0 : 0.5;
+            }
+        }
+    }
+
+    ta := TouchArea {
+        width: 100%;
+        height: 100%;
+        mouse-cursor: default;
+        clicked => {
+            if (root.item-enabled) {
+                root.activated();
+            }
+        }
+    }
+}
+
+export component ChromeMenuSeparator inherits Rectangle {
+    height: 9px;
+    vertical-stretch: 0;
+
+    VerticalLayout {
+        padding-top: 4px;
+        padding-bottom: 4px;
+
+        Rectangle {
+            height: 1px;
+            background: Theme.border;
+        }
+    }
+}
+
+// Shared chrome for title-bar dropdown / submenu flyouts.
+//
+// Hit-test pattern for side-cascade ChromeSubmenu flyouts:
+// Flyout @children must stay under ChromeSubmenu (Slint has one @children slot;
+// true reparent into this popup is awkward). Painting can overflow a 32px row
+// (clip: false), but PopupWindow only hit-tests inside its sized surface — so
+// when a submenu is open we grow THIS root (preferred width/height) to cover
+// the 200px cascade column + flyout rows below the L1 bottom. L1 chrome stays
+// on `l1-panel` only; VerticalLayout preferred height is unchanged (no
+// "submenu under menu" growth).
+export component ChromeMenuPopup inherits Rectangle {
+    // Any in-panel ChromeSubmenu open in this L1 menu.
+    in property <bool> cascade-open: false;
+    // Literal panel-height of the open flyout (padding + rows); used to extend
+    // popup height when the flyout hangs below the L1 panel.
+    in property <length> cascade-panel-height: 0px;
+
+    background: transparent;
+    border-width: 0px;
+    clip: false;
+
+    // PopupWindow sizes from this root — include cascade column when open.
+    min-width: l1-panel.width + (root.cascade-open ? 200px : 0px);
+    preferred-width: l1-panel.width + (root.cascade-open ? 200px : 0px);
+    // Worst case: trigger on last L1 row → flyout extends (panel-height - 32px)
+    // below the L1 panel.
+    preferred-height: l1-panel.height + (root.cascade-open
+        ? max(0px, root.cascade-panel-height - 32px)
+        : 0px);
+    min-height: root.preferred-height;
+
+    // Visual L1 panel only (square corners, shadow). Does not span the cascade
+    // column — flyout draws its own chrome at x: trigger.width.
+    l1-panel := Rectangle {
+        x: 0px;
+        y: 0px;
+        // Panel mins/preferred must drive PopupWindow via root preferred-*;
+        // VerticalLayout.min-width alone does not become preferred.
+        width: max(200px, lay.preferred-width);
+        height: max(lay.preferred-height, lay.min-height);
+        background: Theme.bg-panel;
+        border-radius: 0px;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-color: Theme.shadow-menu;
+        drop-shadow-offset-y: 8px;
+        drop-shadow-blur: 16px;
+        clip: false;
+
+        lay := VerticalLayout {
+            // Menu popup chrome padding (all sides) — tweak here
+            padding: 4px;
+            min-width: 200px;
+            alignment: start;
+            @children
+        }
+    }
+}
+
+// Submenu trigger row + in-panel flyout (same L1 PopupWindow — no nested PopupWindow).
+// Height is a literal formula (padding + rows); never bind preferred-height from a
+// nested popup (Slint #6000 / preferred-size cycle). Parent L1 holds
+// active-submenu-id so only one flyout is open at a time.
+//
+// Flyout is absolutely positioned at x: parent.width (to the RIGHT of the L1
+// trigger row) so @children stay mounted without an `if` (forbidden for
+// @children) and without expanding the menu row when open. Hit-testing for the
+// full flyout requires ChromeMenuPopup.cascade-open (PopupWindow surface).
+export component ChromeSubmenu inherits Rectangle {
+    in property <string> title;
+    // Non-separator ChromeMenuItem rows in the flyout.
+    in property <int> item-count: 1;
+    // ChromeMenuSeparator rows (9px each) in the flyout.
+    in property <int> separator-count: 0;
+    in property <int> submenu-id: 0;
+    // Two-way bound to AppWindow's per-menu active-submenu token (-1 = none).
+    in-out property <int> active-submenu-id: -1;
+
+    property <bool> open: root.active-submenu-id == root.submenu-id;
+    // 4px + 4px chrome padding + 32px rows + 9px separators.
+    property <length> panel-height: 8px + 32px * root.item-count + 9px * root.separator-count;
+
+    // Always one menu row — flyout cascades beside, never grows the VerticalLayout.
+    height: 32px;
+    width: 100%;
+    vertical-stretch: 0;
+    clip: false;
+
+    item := ChromeMenuItem {
+        x: 0px;
+        y: 0px;
+        width: 100%;
+        height: 32px;
+        title: root.title;
+        has-submenu: true;
+        active: root.open;
+        activated => {
+            if (root.open) {
+                root.active-submenu-id = -1;
+            } else {
+                root.active-submenu-id = root.submenu-id;
+            }
+        }
+        // Open on hover (and switch between Zoom/Theme/…). Do not clear on
+        // has-hover false — that would close while the pointer moves into the flyout.
+        changed has-hover => {
+            if (self.has-hover) {
+                root.active-submenu-id = root.submenu-id;
+            }
+        }
+    }
+
+    // In-panel panel (not PopupWindow). Absolute x/y — square corners, fixed size.
+    // Always park at parent.width (never x:0 when closed): a zero-size flyout at
+    // x:0 still hosts a 200px VerticalLayout whose children can steal L1 hover.
+    flyout := Rectangle {
+        x: parent.width;
+        y: 0px;
+        width: root.open ? 200px : 0px;
+        height: root.open ? root.panel-height : 0px;
+        visible: root.open;
+        clip: true;
+        background: Theme.bg-panel;
+        border-radius: 0px;
+        border-width: root.open ? 1px : 0px;
+        border-color: Theme.border;
+        drop-shadow-color: Theme.shadow-menu;
+        drop-shadow-offset-y: root.open ? 8px : 0px;
+        drop-shadow-blur: root.open ? 16px : 0px;
+
+        VerticalLayout {
+            padding: 4px;
+            width: 200px;
+            alignment: start;
+            @children
+        }
+    }
+}

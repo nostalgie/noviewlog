@@ -1,0 +1,34 @@
+[package]
+name = "noviewlog-core"
+version = "0.3.0"
+edition = "2021"
+description = "NoViewLog engine — PTY, parsing, filters, offscreen viewport"
+license = "MIT"
+repository = "https://github.com/nostalgie/noviewlog"
+
+[lib]
+name = "noviewlog_core"
+crate-type = ["rlib"]
+
+[dependencies]
+noviewlog-terminal = { path = "../noviewlog-terminal", version = "0.1.0" }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+dirs = "6"
+fontdue = "0.9"
+png = "0.17"
+portable-pty = "0.8"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Issue #86: upstream `serde_yaml` 0.9 is archived/unmaintained. `serde_yaml_ng`
+# is a maintained drop-in fork (same API, same YAML emitter); the dependency is
+# renamed to `serde_yaml` so all call sites stay unchanged.
+serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
+ttf-parser = "0.25"
+vte = "0.15"
+
+[lints]
+workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.10"

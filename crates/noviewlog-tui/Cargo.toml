@@ -1,0 +1,24 @@
+[package]
+name = "noviewlog-tui"
+version = "0.1.0"
+edition = "2021"
+description = "NoViewLog terminal UI host — engine as a TUI inside any ANSI terminal emulator"
+license = "MIT"
+repository = "https://github.com/nostalgie/noviewlog"
+readme = "README.md"
+
+[[bin]]
+name = "noviewlog-tui"
+path = "src/main.rs"
+
+[dependencies]
+noviewlog-core = { path = "../noviewlog-core" }
+noviewlog-terminal = { path = "../noviewlog-terminal" }
+crossterm = "0.29"
+arboard = "3"
+
+[dev-dependencies]
+portable-pty = "0.8"
+
+[lints]
+workspace = true

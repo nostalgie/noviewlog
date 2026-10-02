@@ -1,0 +1,107 @@
+# Bundled filter presets shipped with NoViewLog.
+# User overrides / additions: ~/.config/noviewlog/config.yaml under `presets:`.
+# Bundled keys still load underneath; same id in user config wins.
+
+default_format: node-default
+default_preset: node-dev
+
+formats: {}
+
+presets:
+  node-dev:
+    filters:
+      - id: hide-deprecation
+        type: exclude
+        pattern: '(node:.*DeprecationWarning|DEP0\d+)'
+        enabled: true
+        use_regex: true
+      - id: only-errors
+        type: include
+        pattern: '(Error|ERROR|Exception)'
+        enabled: false
+        use_regex: true
+
+  node-errors:
+    filters:
+      - id: only-errors
+        type: include
+        pattern: '(Error|ERROR|Exception|UnhandledPromiseRejection)'
+        enabled: true
+        use_regex: true
+
+  php-dev:
+    filters:
+      - id: hide-notices
+        type: exclude
+        pattern: '(PHP (Notice|Deprecated|Strict standards)|Deprecated:)'
+        enabled: true
+        use_regex: true
+      - id: only-errors
+        type: include
+        pattern: '(Fatal error|Parse error|Uncaught|Exception|ERROR)'
+        enabled: false
+        use_regex: true
+
+  php-errors:
+    filters:
+      - id: only-errors
+        type: include
+        pattern: '(Fatal error|Parse error|Uncaught|Exception)'
+        enabled: true
+        use_regex: true
+
+  python-dev:
+    filters:
+      - id: hide-pip-noise
+        type: exclude
+        pattern: '(urllib3\.(connectionpool|util\.retry)|InsecureRequestWarning|pip\._internal)'
+        enabled: true
+        use_regex: true
+      - id: only-errors
+        type: include
+        pattern: '(Error|Exception|Traceback|CRITICAL)'
+        enabled: false
+        use_regex: true
+
+  python-errors:
+    filters:
+      - id: only-errors
+        type: include
+        pattern: '(Error|Exception|Traceback|CRITICAL)'
+        enabled: true
+        use_regex: true
+
+  go-errors:
+    filters:
+      - id: only-errors
+        type: include
+        pattern: '(panic:|fatal|ERROR|Error:)'
+        enabled: true
+        use_regex: true
+
+  nginx-access:
+    filters:
+      # Enable to hide successful 2xx/3xx access lines; leave off to see everything.
+      - id: hide-success
+        type: exclude
+        pattern: ' (2\d\d|3\d\d) '
+        enabled: false
+        use_regex: true
+      - id: only-errors
+        type: include
+        pattern: ' (4\d\d|5\d\d) '
+        enabled: false
+        use_regex: true
+
+  docker-compose:
+    filters:
+      - id: hide-healthcheck
+        type: exclude
+        pattern: '(healthcheck|Health check|container .* (un)?healthy)'
+        enabled: true
+        use_regex: true
+      - id: hide-restart-chatter
+        type: exclude
+        pattern: '(Restarting|Started|Stopped|Waiting)'
+        enabled: false
+        use_regex: true

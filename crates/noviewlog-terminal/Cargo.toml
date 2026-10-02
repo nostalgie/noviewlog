@@ -1,0 +1,21 @@
+[package]
+name = "noviewlog-terminal"
+version = "0.1.0"
+edition = "2021"
+description = "NoViewLog terminal layer — VTE ingest, log record parsing, filters, SGR"
+license = "MIT"
+repository = "https://github.com/nostalgie/noviewlog"
+readme = "README.md"
+
+[lib]
+name = "noviewlog_terminal"
+crate-type = ["rlib"]
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+vte = "0.15"
+
+[lints]
+workspace = true
