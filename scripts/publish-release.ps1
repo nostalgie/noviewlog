@@ -405,6 +405,14 @@ try {
     Assert-LastExit 'git rm (clear worktree)'
     Copy-Item -Path (Join-Path $Stage '*') -Destination $Wt -Recurse -Force
     git -C $Wt add -A
+    # Copy-Item on Windows drops the executable bit; restore tracked +x shell scripts.
+    foreach ($line in (git -C $Root ls-files -s 'scripts/*.sh')) {
+        if ($line -match '^100755\s+\S+\s+\S+\s+(.+)$') {
+            $rel = $Matches[1] -replace '\\', '/'
+            git -C $Wt update-index --chmod=+x -- $rel
+            Assert-LastExit "git update-index --chmod=+x $rel"
+        }
+    }
     if ($hasBranch) {
         git -C $Wt diff --cached --quiet
         if ($LASTEXITCODE -eq 0) {
