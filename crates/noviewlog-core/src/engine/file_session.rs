@@ -5,6 +5,84 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// (issue #151). One cheap stat per loaded session per sweep.
 pub(crate) const FILE_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// Absolute scrollbar → window mapping fractions (issue #339).
+/// Treat max_scroll this small as "already at EOF" (degenerate short files).
+const SCROLL_NEAR_EOF_MAX: f32 = 0.5;
+/// Keep the target this far from loaded-window edges before accepting a
+/// pure-local scroll (`loaded / N`).
+const SCROLL_EDGE_MARGIN_DIV: usize = 5;
+/// Absolute scrollbar recenter: place the target this far into the new window
+/// (`window / N`). Wheel recenter in [`Engine::apply_match_window`] uses
+/// [`MATCH_WINDOW_RECENTER_LEAD_DIV`] (tighter — intentional).
+const SCROLL_RECENTER_LEAD_DIV: usize = 3;
+/// Match-window wheel recenter lead (`window / N`).
+const MATCH_WINDOW_RECENTER_LEAD_DIV: usize = 4;
+
+/// Result of mapping a global scrollbar offset onto a sliding window.
+struct MappedGlobalScroll {
+    new_start: u64,
+    local_raw: f32,
+    near_eof: bool,
+    /// Target already sits comfortably inside the current window.
+    stay_local: bool,
+}
+
+/// Shared mapper for file-line and match-ordinal absolute scrollbar jumps.
+fn map_global_scroll_to_window(
+    global_offset: f32,
+    max_scroll: f32,
+    viewport_h: f32,
+    stride: f32,
+    total: u64,
+    window: u64,
+    current_start: u64,
+    current_len: u64,
+) -> MappedGlobalScroll {
+    let max_start = total.saturating_sub(window);
+    let target = ((global_offset / stride).floor() as u64).min(total.saturating_sub(1));
+    // Only pin the last window when the thumb is actually at the track bottom.
+    // `target >= max_start` alone misclassified mid-file drags (e.g. lines
+    // 16k–20k on a 26k file with a 10k window) as EOF and snapped the thumb to
+    // the end (#339).
+    let at_track_bottom = viewport_h > 0.0 && global_offset + viewport_h >= max_scroll - 1.0;
+    let near_eof = max_scroll <= SCROLL_NEAR_EOF_MAX || at_track_bottom;
+
+    if near_eof {
+        let local = (global_offset - max_start as f32 * stride).max(0.0);
+        return MappedGlobalScroll {
+            new_start: max_start,
+            local_raw: local,
+            near_eof: true,
+            stay_local: false,
+        };
+    }
+
+    let end = current_start.saturating_add(current_len);
+    let margin = (current_len / SCROLL_EDGE_MARGIN_DIV as u64).max(1);
+    let comfortably_inside =
+        current_len > 0 && target >= current_start.saturating_add(margin) && target + margin < end;
+    if comfortably_inside {
+        let local = global_offset - current_start as f32 * stride;
+        return MappedGlobalScroll {
+            new_start: current_start,
+            local_raw: local,
+            near_eof: false,
+            stay_local: true,
+        };
+    }
+
+    let new_start = target
+        .saturating_sub(window / SCROLL_RECENTER_LEAD_DIV as u64)
+        .min(max_start);
+    let local = (global_offset - new_start as f32 * stride).max(0.0);
+    MappedGlobalScroll {
+        new_start,
+        local_raw: local,
+        near_eof: false,
+        stay_local: false,
+    }
+}
+
 /// Progress / result of a background whole-file match scan (issue #55).
 pub(crate) enum MatchScanProgress {
     Progressing { next: u64, match_count: usize },
@@ -148,6 +226,7 @@ impl Engine {
             terminal.file_backed = None;
             terminal.file_changed = false;
             terminal.pending_file_window = None;
+            terminal.pending_open_scroll_eof = false;
             terminal.buffer_line_start = 0;
             terminal.buffer_line_end = 0;
             terminal.buffer.clear();
@@ -254,10 +333,14 @@ impl Engine {
                             self.status_message = format!(
                                 "Indexing: {display_path}… ({index_pct}%, {content_lines_read} lines visible)"
                             );
+                            self.push_event(
+                                json!({"type":"status","message": self.status_message}),
+                            );
                         }
                     } else if !content_done {
                         self.status_message =
                             format!("Loading: {display_path}… ({content_lines_read} lines)");
+                        self.push_event(json!({"type":"status","message": self.status_message}));
                     }
                 }
                 crate::file_load::LoadEvent::Done {
@@ -269,9 +352,9 @@ impl Engine {
                     {
                         let terminal = self.active_terminal_mut();
                         if let Some(last) = terminal.parser.flush_pending() {
-                            let shifted = terminal.buffer.add(last);
-                            terminal.buffer_line_start += shifted as u64;
+                            let _ = terminal.buffer.add(last);
                         }
+                        // Window counters come from the load result, not ring shifts.
                         terminal.buffer_line_start = tail_start_line;
                         terminal.buffer_line_end = tail_start_line + content_lines_read;
                         terminal.file_backed = Some(*backed);
@@ -283,6 +366,12 @@ impl Engine {
                     self.status_message =
                         format!("Opened: {display_path} ({total} lines, scroll for full file)");
                     self.push_event(json!({"type":"status","message": self.status_message}));
+                    // Large files open on a capped tail chunk — pin EOF once rebuilt.
+                    // Small files that fully fit in one window stay at scroll 0.
+                    let window = self.file_view_window_lines() as u64;
+                    let pin_eof = !self.active_view().uses_match_index()
+                        && (content_lines_read < total || total > window);
+                    self.active_terminal_mut().pending_open_scroll_eof = pin_eof;
                     // The handle stays out; drop the borrowed one.
                     return;
                 }
@@ -355,6 +444,27 @@ impl Engine {
         self.last_stats_at = None;
     }
 
+    /// After [`LoadEvent::Done`], scroll to EOF once flat lines and the global
+    /// scroll range reflect the indexed file (not the provisional tail chunk).
+    pub(crate) fn maybe_apply_open_eof_scroll(&mut self) {
+        let original = self.active_terminal;
+        for idx in 0..self.terminals.len() {
+            if !self.terminals[idx].pending_open_scroll_eof {
+                continue;
+            }
+            if self.terminals[idx].file_load.is_some() {
+                continue;
+            }
+            self.active_terminal = idx;
+            self.terminals[idx].pending_open_scroll_eof = false;
+            if self.active_view().uses_match_index() {
+                continue;
+            }
+            self.scroll_to_end();
+        }
+        self.active_terminal = original.min(self.terminals.len().saturating_sub(1));
+    }
+
     pub(crate) fn maybe_prefetch_file_window(&mut self) {
         if !self.has_active_terminal() || self.active_terminal().file_load.is_some() {
             return;
@@ -418,7 +528,7 @@ impl Engine {
             };
             let local_max_guess = content_h + scroll_adjust;
             let new_local = (scroll_y + scroll_adjust).clamp(0.0, local_max_guess);
-            self.request_file_window_at(new_start, new_local);
+            self.request_file_window_at(new_start, new_local, false);
         } else if need_down {
             let new_start = (window_start + step).min(total_lines.saturating_sub(window_lines));
             if new_start <= window_start {
@@ -439,7 +549,7 @@ impl Engine {
                 advanced as f32 * row_stride
             };
             let new_local = (scroll_y - scroll_adjust).max(0.0);
-            self.request_file_window_at(new_start, new_local);
+            self.request_file_window_at(new_start, new_local, false);
         }
     }
 
@@ -477,41 +587,33 @@ impl Engine {
         }
 
         let window = self.file_view_window_lines() as u64;
-        let max_start = total.saturating_sub(window);
-        let target_line = ((global_offset / stride).floor() as u64).min(total.saturating_sub(1));
+        let current_len = end.saturating_sub(start);
+        let mapped = map_global_scroll_to_window(
+            global_offset,
+            max_scroll,
+            viewport_h,
+            stride,
+            total,
+            window,
+            start,
+            current_len,
+        );
 
-        // Pin the last window when the thumb is at / near EOF.
-        let near_eof = max_scroll <= 0.5
-            || global_offset + viewport_h >= max_scroll
-            || target_line >= max_start;
-
-        let (new_start, local_raw) = if near_eof {
-            let local = (global_offset - max_start as f32 * stride).max(0.0);
-            (max_start, local)
-        } else {
-            let win_len = end.saturating_sub(start).max(1);
-            let margin = (win_len / 5).max(1);
-            let comfortably_inside =
-                target_line >= start.saturating_add(margin) && target_line + margin < end;
-            if comfortably_inside {
-                let local = global_offset - start as f32 * stride;
-                let local_max = self.local_window_max_scroll();
-                self.active_terminal_mut().scroll_offset_y = local.clamp(0.0, local_max);
-                self.maybe_prefetch_file_window();
-                self.mark_viewport_dirty();
-                return;
-            }
-            let new_start = target_line.saturating_sub(window / 3).min(max_start);
-            let local = (global_offset - new_start as f32 * stride).max(0.0);
-            (new_start, local)
-        };
-
-        let local_cap = window as f32 * stride;
-        let local = local_raw.min(local_cap);
-
-        if new_start == start && end > start {
+        if mapped.stay_local {
             let local_max = self.local_window_max_scroll();
-            let local = if near_eof {
+            self.active_terminal_mut().scroll_offset_y = mapped.local_raw.clamp(0.0, local_max);
+            self.maybe_prefetch_file_window();
+            self.mark_viewport_dirty();
+            return;
+        }
+
+        // Do not cap to raw window height — WRAP can make visual local scroll
+        // much larger; finish_file_window clamps to local_window_max_scroll().
+        let local = mapped.local_raw.max(0.0);
+
+        if mapped.new_start == start && end > start {
+            let local_max = self.local_window_max_scroll();
+            let local = if mapped.near_eof {
                 local_max
             } else {
                 local.clamp(0.0, local_max)
@@ -523,10 +625,9 @@ impl Engine {
         }
 
         // Keep showing the current window until the new chunk lands (no black flash).
-        // Near EOF: ask for the bottom of the window; finish clamps to real local_max
-        // (Wrap ON can make visual height > raw window * stride).
-        let pending_local = if near_eof { f32::MAX } else { local };
-        self.request_file_window_at(new_start, pending_local);
+        // Near EOF: pin_to_end; finish clamps to real local_max (Wrap ON can make
+        // visual height > raw window * stride).
+        self.request_file_window_at(mapped.new_start, local, mapped.near_eof);
         self.mark_viewport_dirty();
     }
 
@@ -537,7 +638,12 @@ impl Engine {
             .min(FILE_VIEW_WINDOW_LINES)
     }
 
-    pub(crate) fn request_file_window_at(&mut self, new_start: u64, scroll_y: f32) {
+    pub(crate) fn request_file_window_at(
+        &mut self,
+        new_start: u64,
+        scroll_y: f32,
+        pin_to_end: bool,
+    ) {
         let window = self.file_view_window_lines() as u64;
         let (end_line, same_pending) = {
             let terminal = self.active_terminal();
@@ -554,6 +660,7 @@ impl Engine {
         if same_pending {
             if let Some(pending) = self.active_terminal_mut().pending_file_window.as_mut() {
                 pending.scroll_y = scroll_y;
+                pending.pin_to_end = pin_to_end;
             }
             self.mark_viewport_dirty();
             return;
@@ -564,6 +671,7 @@ impl Engine {
         self.active_terminal_mut().pending_file_window = Some(PendingFileWindow {
             new_start,
             scroll_y,
+            pin_to_end,
             next_line: new_start,
             end_line,
             lines: Vec::new(),
@@ -792,24 +900,23 @@ impl Engine {
             .unwrap_or(0);
         match progress {
             MatchScanProgress::Progressing { next, match_count } => {
-                let view = &mut self.terminals[idx].views[view_idx];
-                view.match_scan_pos = Some(next);
-                if !is_active {
-                    return;
-                }
                 let pct = if file_size == 0 {
                     100
                 } else {
                     ((next as f32 / file_size as f32) * 100.0) as u32
                 };
                 // Throttle status churn: update every ~5% (same idea as file indexing).
-                let prev_pct = self
-                    .status_message
-                    .strip_prefix("Scanning filters… ")
-                    .and_then(|rest| rest.split('%').next())
-                    .and_then(|s| s.parse::<u32>().ok())
-                    .unwrap_or(0);
-                if pct >= 99 || pct / 5 > prev_pct / 5 {
+                // Percent lives on the view — never parse the status string back.
+                let prev_pct = self.terminals[idx].views[view_idx].last_match_scan_pct;
+                let report = is_active && (pct >= 99 || pct / 5 > prev_pct / 5);
+                {
+                    let view = &mut self.terminals[idx].views[view_idx];
+                    view.match_scan_pos = Some(next);
+                    if report {
+                        view.last_match_scan_pct = pct;
+                    }
+                }
+                if report {
                     self.status_message =
                         format!("Scanning filters… {pct}% ({match_count} matches)");
                     self.push_event(json!({"type":"status","message": self.status_message}));
@@ -860,6 +967,7 @@ impl Engine {
         let format = self.current_format();
         let raw_count = pending.lines.len() as u64;
         let desired_scroll = pending.scroll_y;
+        let pin_to_end = pending.pin_to_end;
         {
             let terminal = &mut self.terminals[term_idx];
             terminal.parser = RecordParser::new(format);
@@ -884,7 +992,11 @@ impl Engine {
         let local_max = self.local_window_max_scroll();
         {
             let terminal = &mut self.terminals[term_idx];
-            terminal.scroll_offset_y = terminal.scroll_offset_y.clamp(0.0, local_max);
+            terminal.scroll_offset_y = if pin_to_end {
+                local_max
+            } else {
+                terminal.scroll_offset_y.clamp(0.0, local_max)
+            };
         }
         self.mark_viewport_dirty();
     }
@@ -933,40 +1045,34 @@ impl Engine {
         let max_scroll = self.max_scroll_offset();
         let global_offset = global_offset.clamp(0.0, max_scroll);
 
-        let window = crate::file_match::MATCH_WINDOW_LINES;
-        let max_start = total.saturating_sub(window);
-        let target = ((global_offset / stride).floor() as usize).min(total.saturating_sub(1));
-        let near_end =
-            max_scroll <= 0.5 || global_offset + viewport_h >= max_scroll || target >= max_start;
+        let window = crate::file_match::MATCH_WINDOW_LINES as u64;
+        let start = self.active_view().match_window_start as u64;
+        let loaded = self.active_view().flat_lines.len() as u64;
+        let mapped = map_global_scroll_to_window(
+            global_offset,
+            max_scroll,
+            viewport_h,
+            stride,
+            total as u64,
+            window,
+            start,
+            loaded,
+        );
 
-        let (new_start, local_raw) = if near_end {
-            let local = (global_offset - max_start as f32 * stride).max(0.0);
-            (max_start, local)
-        } else {
-            let start = self.active_view().match_window_start;
-            let loaded = self.active_view().flat_lines.len();
-            let end = start.saturating_add(loaded);
-            let margin = (loaded / 5).max(1);
-            let comfortably_inside =
-                loaded > 0 && target >= start.saturating_add(margin) && target + margin < end;
-            if comfortably_inside {
-                let local = global_offset - start as f32 * stride;
-                let local_max = self.local_window_max_scroll();
-                self.active_terminal_mut().scroll_offset_y = local.clamp(0.0, local_max);
-                self.mark_viewport_dirty();
-                return;
-            }
-            let new_start = target.saturating_sub(window / 3).min(max_start);
-            let local = (global_offset - new_start as f32 * stride).max(0.0);
-            (new_start, local)
-        };
+        if mapped.stay_local {
+            let local_max = self.local_window_max_scroll();
+            self.active_terminal_mut().scroll_offset_y = mapped.local_raw.clamp(0.0, local_max);
+            self.mark_viewport_dirty();
+            return;
+        }
 
+        let new_start = mapped.new_start as usize;
         self.active_view_mut().match_window_start = new_start;
-        self.active_terminal_mut().scroll_offset_y = local_raw;
+        self.active_terminal_mut().scroll_offset_y = mapped.local_raw;
         self.apply_match_window();
         let local_max = self.local_window_max_scroll();
         let terminal = self.active_terminal_mut();
-        terminal.scroll_offset_y = if near_end {
+        terminal.scroll_offset_y = if mapped.near_eof {
             local_max
         } else {
             terminal.scroll_offset_y.clamp(0.0, local_max)
@@ -1170,7 +1276,7 @@ impl Engine {
         let end = start.saturating_add(loaded.min(window));
         // Margin must scale with the *loaded* window, not MATCH_WINDOW_LINES — otherwise
         // small match sets always look like "near the end" and re-read every tick.
-        let margin = (loaded / 5).max(1);
+        let margin = (loaded / SCROLL_EDGE_MARGIN_DIV).max(1);
         let need_recenter = loaded == 0
             || target < start.saturating_add(margin)
             || (end > start && target + margin >= end);
@@ -1179,7 +1285,9 @@ impl Engine {
             self.active_terminal_mut().scroll_offset_y = local.clamp(0.0, local_max);
             return;
         }
-        start = target.saturating_sub(window / 4).min(max_start);
+        start = target
+            .saturating_sub(window / MATCH_WINDOW_RECENTER_LEAD_DIV)
+            .min(max_start);
         let start = start.min(total);
 
         // The recenter read runs on a worker thread (issue #55): one in
@@ -1331,12 +1439,40 @@ mod tests {
     }
 
     #[test]
+    fn map_global_scroll_mid_file_is_not_eof() {
+        let stride = 20.0;
+        let viewport_h = 400.0;
+        let total = 25_990_u64;
+        let window = 2_000_u64;
+        let max_start = total - window;
+        let max_scroll = total as f32 * stride - viewport_h;
+        // ~line 18k (the user's 16k–20k "black hole" band).
+        let global = 18_000.0 * stride;
+        let mapped = map_global_scroll_to_window(
+            global, max_scroll, viewport_h, stride, total, window,
+            max_start, // tail window resident
+            window,
+        );
+        assert!(
+            !mapped.near_eof,
+            "mid-file absolute scroll must not pin EOF (new_start={})",
+            mapped.new_start
+        );
+        assert!(
+            mapped.new_start < max_start.saturating_sub(window / 4),
+            "should recenter around line 18k, got new_start={} max_start={max_start}",
+            mapped.new_start
+        );
+    }
+
+    #[test]
     fn file_window_spawn_failure_drops_pending_and_reports() {
         let mut engine = Engine::new();
         let term_id = engine.terminals[0].id.clone();
         engine.terminals[0].pending_file_window = Some(PendingFileWindow {
             new_start: 10,
             scroll_y: 2.0,
+            pin_to_end: false,
             next_line: 10,
             end_line: 20,
             lines: Vec::new(),

@@ -94,11 +94,8 @@ impl Engine {
 
     #[cfg(test)]
     pub fn ensure_live_screen_for_test(&mut self) {
-        if !self.has_active_terminal() {
-            return;
-        }
-        let terminal = self.active_terminal_mut();
-        terminal.ingest.ensure_live_screen(&mut terminal.buffer);
+        // Historical seam: live screen is always present after TerminalIngest::new.
+        let _ = self;
     }
 
     #[cfg(test)]
@@ -195,6 +192,13 @@ impl Engine {
         while self.file_load_pending_for_test() {
             self.advance_file_load();
         }
+        self.rebuild_if_needed();
+        self.maybe_apply_open_eof_scroll();
+    }
+
+    #[cfg(test)]
+    pub fn maybe_apply_open_eof_scroll_for_test(&mut self) {
+        self.maybe_apply_open_eof_scroll();
     }
 
     #[cfg(test)]

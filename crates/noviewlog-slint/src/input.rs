@@ -3,6 +3,9 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use noviewlog_core::core::types::{
+    DEFAULT_VIEWPORT_FONT_SIZE, MAX_VIEWPORT_FONT_SIZE, MIN_VIEWPORT_FONT_SIZE,
+};
 use noviewlog_core::{Command, Engine};
 use slint::ComponentHandle;
 
@@ -91,6 +94,12 @@ pub(crate) fn handle_key_event(engine: &mut Engine, text: &str, ctrl_or_meta: bo
         return true;
     }
 
+    if is_private_use_key(text) {
+        // Unmapped special key: swallow it rather than send the private-use
+        // codepoint into the shell as UTF-8 mojibake (issue #319).
+        return true;
+    }
+
     engine.handle_key(text.as_bytes());
     true
 }
@@ -98,6 +107,15 @@ pub(crate) fn handle_key_event(engine: &mut Engine, text: &str, ctrl_or_meta: bo
 pub(crate) fn is_terminal_control_text(text: &str) -> bool {
     text.chars()
         .all(|ch| matches!(ch, '\r' | '\n' | '\t' | '\u{7f}' | '\u{8}') || ch < ' ')
+}
+
+/// Slint encodes non-text keys (arrows, Insert, F1–F12) as private-use
+/// codepoints. Any of them that `map_special_key` does not map must never
+/// reach the PTY — the shell would receive their UTF-8 bytes as garbage.
+pub(crate) fn is_private_use_key(text: &str) -> bool {
+    text.chars()
+        .next()
+        .is_some_and(|c| ('\u{f700}'..='\u{f7ff}').contains(&c))
 }
 
 pub(crate) fn map_special_key(text: &str) -> Option<&'static [u8]> {
@@ -115,6 +133,18 @@ pub(crate) fn map_special_key(text: &str) -> Option<&'static [u8]> {
     const END: &str = "\u{f72b}";
     const PAGE_UP: &str = "\u{f72c}";
     const PAGE_DOWN: &str = "\u{f72d}";
+    const F1: &str = "\u{f704}";
+    const F2: &str = "\u{f705}";
+    const F3: &str = "\u{f706}";
+    const F4: &str = "\u{f707}";
+    const F5: &str = "\u{f708}";
+    const F6: &str = "\u{f709}";
+    const F7: &str = "\u{f70a}";
+    const F8: &str = "\u{f70b}";
+    const F9: &str = "\u{f70c}";
+    const F10: &str = "\u{f70d}";
+    const F11: &str = "\u{f70e}";
+    const F12: &str = "\u{f70f}";
 
     match text {
         RETURN | "\r" => Some(b"\r"),
@@ -130,7 +160,20 @@ pub(crate) fn map_special_key(text: &str) -> Option<&'static [u8]> {
         END => Some(b"\x1b[F"),
         PAGE_UP => Some(b"\x1b[5~"),
         PAGE_DOWN => Some(b"\x1b[6~"),
-        INSERT => None,
+        // xterm sequences: SS3 for F1–F4, CSI ~ for the rest (issue #319).
+        F1 => Some(b"\x1bOP"),
+        F2 => Some(b"\x1bOQ"),
+        F3 => Some(b"\x1bOR"),
+        F4 => Some(b"\x1bOS"),
+        F5 => Some(b"\x1b[15~"),
+        F6 => Some(b"\x1b[17~"),
+        F7 => Some(b"\x1b[18~"),
+        F8 => Some(b"\x1b[19~"),
+        F9 => Some(b"\x1b[20~"),
+        F10 => Some(b"\x1b[21~"),
+        F11 => Some(b"\x1b[23~"),
+        F12 => Some(b"\x1b[24~"),
+        INSERT => Some(b"\x1b[2~"),
         _ => None,
     }
 }
@@ -320,17 +363,19 @@ pub(crate) fn install_key_event(
         }
         if ctrl {
             if is_zoom_in_key(&text) {
-                let next = (viewport_font_size.get() + 1.0).clamp(8.0, 32.0);
+                let next = (viewport_font_size.get() + 1.0)
+                    .clamp(MIN_VIEWPORT_FONT_SIZE, MAX_VIEWPORT_FONT_SIZE);
                 apply_zoom(&ctx, &viewport_font_size, next);
                 return true;
             }
             if text == "-" {
-                let next = (viewport_font_size.get() - 1.0).clamp(8.0, 32.0);
+                let next = (viewport_font_size.get() - 1.0)
+                    .clamp(MIN_VIEWPORT_FONT_SIZE, MAX_VIEWPORT_FONT_SIZE);
                 apply_zoom(&ctx, &viewport_font_size, next);
                 return true;
             }
             if text == "0" {
-                apply_zoom(&ctx, &viewport_font_size, 13.0);
+                apply_zoom(&ctx, &viewport_font_size, DEFAULT_VIEWPORT_FONT_SIZE);
                 return true;
             }
         }
@@ -351,11 +396,6 @@ pub(crate) fn install_key_event(
             return true;
         }
         if !terminal_tab_active.get() {
-            // Still allow copy from filter tabs.
-            if ctrl && is_key_char(&text, 'c') && has_selection.get() {
-                let _ = copy_selection_to_clipboard(&engine.borrow());
-                return true;
-            }
             // Navigation keys scroll the filter/file viewport (issue #83)
             // instead of being swallowed.
             let nav = match text.as_str() {
@@ -388,7 +428,7 @@ pub(crate) fn install_key_event(
 
 #[cfg(test)]
 mod tests {
-    use super::paste_bytes;
+    use super::{is_private_use_key, map_special_key, paste_bytes};
 
     #[test]
     fn paste_translates_line_endings_to_cr() {
@@ -397,5 +437,32 @@ mod tests {
         assert_eq!(paste_bytes("lone\rtext"), b"lone\rtext");
         assert_eq!(paste_bytes("no endings"), b"no endings");
         assert_eq!(paste_bytes(""), b"");
+    }
+
+    #[test]
+    fn special_keys_map_to_xterm_sequences() {
+        // Issue #319: Insert and F1–F12 previously fell through the map and
+        // their private-use codepoints were written into the PTY as UTF-8
+        // mojibake (Insert -> EF 9C A7).
+        assert_eq!(map_special_key("\u{f727}"), Some(&b"\x1b[2~"[..]));
+        assert_eq!(map_special_key("\u{f704}"), Some(&b"\x1bOP"[..]));
+        assert_eq!(map_special_key("\u{f707}"), Some(&b"\x1bOS"[..]));
+        assert_eq!(map_special_key("\u{f708}"), Some(&b"\x1b[15~"[..]));
+        assert_eq!(map_special_key("\u{f70f}"), Some(&b"\x1b[24~"[..]));
+    }
+
+    #[test]
+    fn every_private_use_key_is_mapped_or_swallowed() {
+        // The guard contract: no private-use key text can reach the
+        // `engine.handle_key(text.as_bytes())` fall-through.
+        for code in [0xf700u32, 0xf704, 0xf710, 0xf727, 0xf730, 0xf7ff] {
+            let text = char::from_u32(code).unwrap().to_string();
+            assert!(
+                map_special_key(&text).is_some() || is_private_use_key(&text),
+                "PUA key U+{code:04X} would leak into the PTY"
+            );
+        }
+        assert!(!is_private_use_key("a"));
+        assert!(!is_private_use_key("\u{e000}")); // another PUA block, not Slint keys
     }
 }

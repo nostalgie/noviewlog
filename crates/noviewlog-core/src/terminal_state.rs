@@ -9,7 +9,6 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::core::buffer::RecordBuffer;
-use crate::core::config::RuntimeConfig;
 use crate::core::parser::RecordParser;
 use crate::core::terminal::TerminalIngest;
 use crate::core::types::{LaunchConfig, LogFormat, TabConfig};
@@ -22,10 +21,19 @@ pub const MAX_CLOSED_TABS: usize = 15;
 
 /// Chunked swap of the in-memory file window while scrolling giant logs.
 pub struct PendingFileWindow {
+    /// First raw file line number of the window being built (0-based).
     pub new_start: u64,
+    /// Target vertical scroll in pixels after the window swap lands.
+    /// Ignored when [`Self::pin_to_end`] is set (issue #339).
     pub scroll_y: f32,
+    /// When true, finish clamps scroll to the window's local max (EOF pin).
+    /// Replaces the old `f32::MAX` / `1.0e20` sentinel protocol across files.
+    pub pin_to_end: bool,
+    /// Next raw file line to append into [`Self::lines`].
     pub next_line: u64,
+    /// Exclusive end raw file line of the window (same space as [`Self::new_start`]).
     pub end_line: u64,
+    /// Lines loaded so far for the pending window (flat text, not visual rows).
     pub lines: Vec<String>,
 }
 
@@ -90,6 +98,9 @@ pub struct TerminalState {
     /// One past the last raw file line in `buffer`.
     pub buffer_line_end: u64,
     pub pending_file_window: Option<PendingFileWindow>,
+    /// After a file load completes, pin to EOF on the next tick once flat
+    /// lines / scroll range are rebuilt (issue #339).
+    pub pending_open_scroll_eof: bool,
     /// Spawn queued but not started yet: executable resolution runs on a
     /// worker thread (issue #59). `None` when there is nothing in flight.
     pub pending_spawn: Option<PendingSpawn>,
@@ -117,15 +128,8 @@ impl TerminalState {
     pub fn file_load_stall_expired(stalled_since: Instant, now: Instant) -> bool {
         now.duration_since(stalled_since) >= crate::file_load::FILE_LOAD_STALL_TIMEOUT
     }
-    pub fn new(
-        id: String,
-        launch: LaunchConfig,
-        runtime: &RuntimeConfig,
-        format: &LogFormat,
-        max_records: usize,
-    ) -> Self {
+    pub fn new(id: String, launch: LaunchConfig, format: &LogFormat, max_records: usize) -> Self {
         let cwd = resolve_initial_cwd(&launch);
-        let _ = runtime;
         Self {
             id,
             cwd,
@@ -154,6 +158,7 @@ impl TerminalState {
             buffer_line_start: 0,
             buffer_line_end: 0,
             pending_file_window: None,
+            pending_open_scroll_eof: false,
             pending_spawn: None,
             pending_stdin: Vec::new(),
         }
@@ -231,8 +236,8 @@ impl TerminalState {
         }
     }
 
-    // Callers never hold zero sessions (terminal_close refuses), but stay
-    // total rather than index-panic if that invariant ever regresses.
+    // Callers never hold zero views (`close_tab` keeps at least the Terminal
+    // tab), but stay total rather than index-panic if that invariant regresses.
     pub fn active_view(&self) -> &LogView {
         let idx = self.clamped_active_idx();
         self.views
@@ -267,7 +272,17 @@ impl TerminalState {
         self.pending_file_window = None;
     }
 
-    pub fn ensure_terminal_tab_view(&mut self, _runtime: &RuntimeConfig) {
+    /// Drop buffer + file-window state so a live launch cannot stay stuck as a
+    /// file session. Shared by `set_launch` and `restart` (issue #335).
+    pub fn clear_session_content(&mut self) {
+        self.buffer.clear();
+        self.file_backed = None;
+        self.pending_file_window = None;
+        self.buffer_line_start = 0;
+        self.buffer_line_end = 0;
+    }
+
+    pub fn ensure_terminal_tab_view(&mut self) {
         if self.views.is_empty() {
             let name = self.primary_tab_name();
             self.views = vec![LogView::from_runtime(&name, Vec::new())];
@@ -282,7 +297,7 @@ impl TerminalState {
     }
 }
 
-pub fn next_terminal_id(_existing: &[TerminalState]) -> String {
+pub fn next_terminal_id() -> String {
     format!("terminal-{}", crate::core::types::unique_time_suffix())
 }
 
@@ -346,7 +361,7 @@ mod tests {
         // Issue #76: millisecond-only ids collided for fast consecutive creates.
         let mut seen = std::collections::HashSet::new();
         for _ in 0..500 {
-            assert!(seen.insert(next_terminal_id(&[])));
+            assert!(seen.insert(next_terminal_id()));
         }
         let projects = vec![crate::core::types::ProjectConfig {
             id: "p".into(),

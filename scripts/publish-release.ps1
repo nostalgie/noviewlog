@@ -350,13 +350,17 @@ try {
         if ($phits.Count -gt 0) {
             Write-Error "Export content guard failed: '$rel' contains personal data ($($phits -join ', ')). Scrub the source file; do not widen the allowlist."
         }
-        $values = @()
-        foreach ($rx in @($EmailRegex, $IpRegex, $KeyRegex, $TokRegex)) {
-            $values += ([regex]::Matches($content, $rx) | ForEach-Object { $_.Value })
-        }
-        $bad = @($values | Sort-Object -Unique | Where-Object { $_.ToLower() -notmatch $ExemptRegex })
-        if ($bad.Count -gt 0) {
-            Write-Error "Export content guard failed (patterns): '$rel' contains: $($bad -join ', '). Scrub the source file; do not widen the allowlist."
+        # Match publish-release.sh: GNU grep skips -o output on binary files (NUL
+        # bytes). Regex over Latin-1 font/png blobs otherwise false-positive emails.
+        if ($content.IndexOf([char]0) -lt 0) {
+            $values = @()
+            foreach ($rx in @($EmailRegex, $IpRegex, $KeyRegex, $TokRegex)) {
+                $values += ([regex]::Matches($content, $rx) | ForEach-Object { $_.Value })
+            }
+            $bad = @($values | Sort-Object -Unique | Where-Object { $_.ToLower() -notmatch $ExemptRegex })
+            if ($bad.Count -gt 0) {
+                Write-Error "Export content guard failed (patterns): '$rel' contains: $($bad -join ', '). Scrub the source file; do not widen the allowlist."
+            }
         }
     }
     Write-Host '==> Content guard OK (tokens, personal data, patterns).'

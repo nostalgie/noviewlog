@@ -55,8 +55,8 @@ fn viewport_press_dismisses_rename() {
         .expect("viewport pointer down")
         + area;
     // Wide window: the selection wiring follows the right-click branch and
-    // explanatory comments (~1300 bytes).
-    let window = &src[down..down.saturating_add(1500).min(src.len())];
+    // explanatory comments (~1800 bytes).
+    let window = &src[down..down.saturating_add(2200).min(src.len())];
     // The window must be the viewport handler (starts selection via
     // viewport-pointer), not the sidebar dead-space TouchArea.
     assert!(
@@ -132,12 +132,23 @@ fn empty_files_list_height_stays_zero_in_slint() {
 
 #[test]
 fn status_bar_press_dismisses_rename() {
+    // The strip is the `StatusBar` component (status-bar.slint): it reports
+    // pointer-down via `pressed-down`, and the host wires that to the dismiss.
     let src = app_slint();
-    let idx = src.rfind("root.status-text").expect("status-text");
-    let window = &src[idx.saturating_sub(900)..idx];
+    let idx = src.find("StatusBar {").expect("StatusBar instance");
+    let window = &src[idx..idx.saturating_add(500).min(src.len())];
     assert!(
-        window.contains("dismiss-any-rename-if-any()"),
+        window.contains("pressed-down => { root.dismiss-any-rename-if-any(); }"),
         "status bar must dismiss rename on pointer-down"
+    );
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui/status-bar.slint");
+    let bar = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let down = bar
+        .find("if (event.kind == PointerEventKind.down)")
+        .expect("StatusBar pointer-down handler");
+    assert!(
+        bar[down..down.saturating_add(120).min(bar.len())].contains("root.pressed-down();"),
+        "StatusBar must fire pressed-down on pointer-down"
     );
 }
 
@@ -170,7 +181,7 @@ fn rename_fields_use_even_inner_padding() {
         "tab rename must use even Theme.field-pad inset"
     );
     let idx = src.find("title-slot := Rectangle").expect("title-slot");
-    let chunk = &src[idx..idx.saturating_add(1800).min(src.len())];
+    let chunk = &src[idx..idx.saturating_add(2200).min(src.len())];
     assert!(
         chunk.matches("x: Theme.rename-pad").count() >= 2
             && chunk
@@ -226,4 +237,86 @@ fn viewport_scrollbar_press_dismisses_rename() {
         wired >= 2,
         "both viewport scrollbars must dismiss rename on press (found {wired})"
     );
+}
+
+#[test]
+fn filters_panel_controls_dismiss_rename() {
+    // Issue #320: the FILTERS panel lives on filter tabs — exactly where
+    // inline rename happens. The always-on rule: any pointer-down outside
+    // the rename TextInput must dismiss it (FilterRow rows already do).
+    let src = app_slint();
+
+    // Anchor at each control's visible label and require the dismiss call
+    // inside the control's own handler: buttons place `clicked => {` just
+    // before the label (chunk = that handler up to the label), the
+    // ModeToggle places `toggled` after it.
+    let clicked_anchors: &[(&str, &str)] = &[
+        ("+ Include button", "text: \"+ Include\";"),
+        ("- Exclude button", "text: \"- Exclude\";"),
+        ("clear-all-filters button", "text: \"Clear all filters\";"),
+    ];
+    for (name, anchor) in clicked_anchors {
+        let idx = src
+            .find(anchor)
+            .unwrap_or_else(|| panic!("{name} anchor {anchor:?} missing"));
+        let clicked = src[..idx]
+            .rfind("clicked => {")
+            .unwrap_or_else(|| panic!("{name}: no clicked handler before {anchor:?}"));
+        assert!(
+            src[clicked..idx].contains("dismiss-any-rename-if-any()"),
+            "{name} must dismiss inline rename before acting (issue #320)"
+        );
+    }
+    let mode = src
+        .find("label: \".*\";")
+        .expect("regex ModeToggle anchor missing");
+    let mode_chunk = &src[mode..(mode + 400).min(src.len())];
+    assert!(
+        mode_chunk.contains("dismiss-any-rename-if-any()"),
+        "regex ModeToggle must dismiss inline rename before acting (issue #320)"
+    );
+}
+
+#[test]
+fn rename_state_machine_lives_in_one_component() {
+    // TabChip and TerminalRow supply chrome only; the init latch, blur-commit
+    // gating and Escape handling (focus-race guards) live in InlineRenameInput.
+    let src = sidebar_slint();
+    let input = src
+        .find("export component InlineRenameInput")
+        .expect("InlineRenameInput component");
+    let input_end = src[input + 1..]
+        .find("export component")
+        .map_or(src.len(), |off| input + 1 + off);
+    let body = &src[input..input_end];
+    for needle in [
+        "had-focus",
+        "closing",
+        "self.focus();",
+        "self.select-all();",
+        "Key.Escape",
+    ] {
+        assert!(
+            body.contains(needle),
+            "InlineRenameInput must own the rename state machine ({needle})"
+        );
+    }
+    for host in [
+        "export component TabChip",
+        "export component TerminalRow inherits",
+    ] {
+        let start = src.find(host).expect(host);
+        let end = src[start + 1..]
+            .find("export component")
+            .map_or(src.len(), |off| start + 1 + off);
+        let chunk = &src[start..end];
+        assert!(
+            chunk.contains("InlineRenameInput {"),
+            "{host} must host InlineRenameInput"
+        );
+        assert!(
+            !chunk.contains("rename-had-focus") && !chunk.contains("TextInput {"),
+            "{host} must not re-implement the rename TextInput state machine"
+        );
+    }
 }

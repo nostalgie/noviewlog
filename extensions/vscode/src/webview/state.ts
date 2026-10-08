@@ -59,10 +59,13 @@ export function applyAppend(state: SessionState, msg: SessionAppendMsg): Session
     // Stale or invalid delta — the host will follow up with a full snapshot.
     return state;
   }
-  const lines: LineDto[] = [...view.lines];
   // Truncate anything past base (live overlay is replaced), then extend.
-  lines.length = msg.base;
-  lines.push(...msg.lines);
+  // A loop, not a spread: one append can carry tens of thousands of lines
+  // and spreading them into `push` is a stack-overflow hazard (issue #322).
+  const lines: LineDto[] = view.lines.slice(0, msg.base);
+  for (const l of msg.lines) {
+    lines.push(l);
+  }
   const nextView: ViewDto = {
     ...view,
     total_lines: msg.total_lines,

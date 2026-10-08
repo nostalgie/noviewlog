@@ -153,8 +153,11 @@ pub struct StatsSnapshot {
     pub file_total_lines: u64,
     #[serde(default)]
     pub file_index_progress: f32,
+    /// Alias of `buffer_line_start` (raw file line at the start of the loaded
+    /// window). Kept for wire stability; same value as [`Self::file_lines_before`].
     #[serde(default)]
     pub file_window_start: u64,
+    /// Alias of `buffer_line_start` — identical to [`Self::file_window_start`].
     #[serde(default)]
     pub file_lines_before: u64,
     #[serde(default)]

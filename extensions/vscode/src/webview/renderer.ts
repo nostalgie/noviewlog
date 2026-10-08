@@ -6,7 +6,7 @@
  */
 
 import type { LineDto, SegDto } from "../protocol";
-import { computeRows, type VisualRow } from "./wrap";
+import { RowLayout, type VisualRow } from "./wrap";
 
 export interface RendererTheme {
   fontFamily: string;
@@ -26,7 +26,9 @@ export class Renderer {
   private rows: VisualRow[] = [];
   private lines: LineDto[] = [];
   private theme: RendererTheme;
-  private columns = 0;
+  /** Incremental layout: appends reuse the prefix rows instead of re-running
+   * the O(buffer) row computation on every host message (issue #322). */
+  private layout = new RowLayout();
   private drawScheduled = false;
   /** dpr captured at relayout time; draw reuses it so bitmap and scale
    * never disagree within one frame. */
@@ -48,11 +50,6 @@ export class Renderer {
     this.theme = theme;
   }
 
-  setTheme(theme: RendererTheme): void {
-    this.theme = theme;
-    this.scheduleDraw();
-  }
-
   setLines(lines: LineDto[], wrap: boolean): void {
     this.lines = lines;
     this.relayout(wrap);
@@ -67,8 +64,8 @@ export class Renderer {
     this.dpr = dpr;
     const cssWidth = this.scroller.clientWidth;
     const charWidth = this.theme.charWidth;
-    this.columns = wrap && charWidth > 0 ? Math.max(1, Math.floor(cssWidth / charWidth)) : 0;
-    this.rows = computeRows(this.lines, this.columns);
+    const columns = wrap && charWidth > 0 ? Math.max(1, Math.floor(cssWidth / charWidth)) : 0;
+    this.rows = this.layout.update(this.lines, columns);
     // The canvas is viewport-sized: Chromium caps bitmap dimensions far
     // below the scroll height of large buffers, so the spacer div carries
     // the scroll height and the canvas paints only the visible slice.
@@ -318,7 +315,8 @@ export class Renderer {
     }
   }
 
-  /** Selected text, rows joined with "\n" (empty when nothing selected). */
+  /** Selected text (empty when nothing selected). Soft-wrapped visual rows of
+   * the same logical line concatenate; `"\n"` only between logical lines. */
   selectionText(): string {
     if (!this.selection) {
       return "";
@@ -327,7 +325,7 @@ export class Renderer {
     const b = this.selection.head;
     const [from, to] =
       a.row > b.row || (a.row === b.row && a.col > b.col) ? [b, a] : [a, b];
-    const out: string[] = [];
+    const slices: { line: number; text: string }[] = [];
     for (let r = from.row; r <= to.row && r < this.rows.length; r++) {
       const vrow = this.rows[r];
       if (!vrow) {
@@ -336,9 +334,9 @@ export class Renderer {
       const text = this.rowText(vrow);
       const start = r === from.row ? Math.min(from.col, text.length) : 0;
       const end = r === to.row ? Math.min(to.col, text.length) : text.length;
-      out.push(text.slice(start, end));
+      slices.push({ line: vrow.line, text: text.slice(start, end) });
     }
-    return out.join("\n");
+    return joinSelectionSlices(slices);
   }
 
   private rowText(vrow: VisualRow): string {
@@ -347,6 +345,25 @@ export class Renderer {
 
   private selection: { anchor: { row: number; col: number }; head: { row: number; col: number } } | null =
     null;
+}
+
+/** Join selected visual-row slices: soft-wrap fragments of the same logical
+ * line concatenate with no separator; `"\n"` only when the logical line
+ * changes (issue #329). */
+export function joinSelectionSlices(
+  slices: ReadonlyArray<{ line: number; text: string }>,
+): string {
+  if (slices.length === 0) {
+    return "";
+  }
+  let out = slices[0].text;
+  for (let i = 1; i < slices.length; i++) {
+    if (slices[i].line !== slices[i - 1].line) {
+      out += "\n";
+    }
+    out += slices[i].text;
+  }
+  return out;
 }
 
 function rgbCss(rgb: [number, number, number]): string {

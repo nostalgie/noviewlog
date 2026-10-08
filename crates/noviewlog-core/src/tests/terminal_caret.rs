@@ -28,8 +28,7 @@ fn terminal_caret_rect_none_when_unfocused() {
 }
 
 #[test]
-#[ignore = "slow tier: fixed 600 ms sleep; run with -- --ignored"]
-fn caret_blink_tick_does_not_dirty_viewport() {
+fn tick_does_not_dirty_viewport_for_caret() {
     let mut engine = Engine::new();
     engine
         .send_command(Command::SetViewportFocus { focused: true })
@@ -40,11 +39,10 @@ fn caret_blink_tick_does_not_dirty_viewport() {
     let mut rgba = vec![0u8; 800 * 600 * 4];
     engine.render(800, 600, &mut rgba).expect("paint");
     assert!(!engine.needs_render());
-    std::thread::sleep(std::time::Duration::from_millis(600));
     engine.tick();
     assert!(
         !engine.needs_render(),
-        "engine caret blink must not dirty the bitmap viewport"
+        "engine tick must not dirty the bitmap viewport for caret blink"
     );
 }
 
@@ -63,7 +61,6 @@ fn follow_wrap_live_caret_stays_near_viewport_bottom() {
     engine.mark_running_for_test();
     {
         let term = engine.active_terminal_mut();
-        term.ingest.ensure_live_screen(&mut term.buffer);
         // Long URLs force WRAP visual height past the viewport → paint scrolls down.
         let long = format!("{}\r\n", "https://example.com/very/long/path/segment/").repeat(40);
         term.ingest

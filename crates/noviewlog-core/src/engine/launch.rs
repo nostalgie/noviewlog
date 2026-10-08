@@ -7,7 +7,10 @@ impl Engine {
         if let Some(path) = &launch.config_path {
             match std::fs::read_to_string(path) {
                 Ok(text) => {
-                    self.config = load_config_from_yaml(&text);
+                    // Issue #321: a YAML typo in a user-named config must be
+                    // reported, not silently swallowed by the fallback.
+                    let (cfg, parse_error) = load_config_from_yaml_checked(&text);
+                    self.config = cfg;
                     self.formats = merge_formats(
                         &crate::core::config::all_format_presets(&self.config),
                         &HashMap::new(),
@@ -17,6 +20,11 @@ impl Engine {
                     // persistence so a later debounced flush cannot overwrite
                     // the user's file.
                     self.config_persist_disabled = true;
+                    if let Some(message) = parse_error {
+                        self.status_message = message;
+                        let message = self.status_message.clone();
+                        self.push_event(json!({"type":"status","message": message}));
+                    }
                 }
                 // A file that is simply absent is not a launch config —
                 // keep persistence as-is.
@@ -50,7 +58,7 @@ impl Engine {
             terminal.exit_code = None;
             terminal.pending_spawn = None;
             terminal.pending_stdin.clear();
-            terminal.buffer.clear();
+            terminal.clear_session_content();
             terminal
                 .ingest
                 .reset_with_size(term_size.cols as usize, term_size.rows as usize);
@@ -100,11 +108,7 @@ impl Engine {
         let term = self.viewport_pty_size();
         {
             let terminal = self.active_terminal_mut();
-            terminal.buffer.clear();
-            terminal.file_backed = None;
-            terminal.pending_file_window = None;
-            terminal.buffer_line_start = 0;
-            terminal.buffer_line_end = 0;
+            terminal.clear_session_content();
             terminal.parser = RecordParser::new(format);
             terminal
                 .ingest

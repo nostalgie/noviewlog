@@ -118,18 +118,6 @@ impl RecordBuffer {
             last.overwrite = overwrite;
         }
     }
-
-    /// Replace the last single-line overwrite record (spinner / progress).
-    /// Returns true if a record was replaced.
-    pub fn replace_last_single_line(&mut self, record: LogRecord) -> bool {
-        if self.last_is_overwrite_single_line() {
-            let _ = self.records.pop_back();
-            self.add(record);
-            return true;
-        }
-        self.add(record);
-        false
-    }
 }
 
 #[cfg(test)]

@@ -11,21 +11,6 @@ use crate::ctx::Ctx;
 use crate::engine_bridge::bump_fast_timer;
 use noviewlog_slint::ui::{AppWindow, TabInfo};
 
-/// Active tab after closing `index`, computed against the post-removal row count.
-/// Retained for tests: tab-close now relies on the stats flush instead of
-/// precomputing the next active row (#198).
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn active_after_close(index: i32, old_active: i32, remaining: usize) -> i32 {
-    let max = (remaining.saturating_sub(1)) as i32;
-    if index < old_active {
-        old_active - 1
-    } else if index == old_active {
-        index.min(max)
-    } else {
-        old_active
-    }
-}
-
 pub(crate) fn install(
     ui: &AppWindow,
     ctx: &Ctx,
@@ -186,26 +171,4 @@ fn install_rename(ui: &AppWindow, ctx: &Ctx, tabs_model: Rc<VecModel<TabInfo>>) 
         }
         ctx.refresh();
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::active_after_close;
-
-    #[test]
-    fn closing_before_active_shifts_left() {
-        assert_eq!(active_after_close(0, 2, 3), 1);
-        assert_eq!(active_after_close(1, 2, 3), 1);
-    }
-
-    #[test]
-    fn closing_active_clamps_to_last_row() {
-        assert_eq!(active_after_close(2, 2, 2), 1);
-        assert_eq!(active_after_close(0, 0, 1), 0);
-    }
-
-    #[test]
-    fn closing_after_active_keeps_active() {
-        assert_eq!(active_after_close(2, 0, 3), 0);
-    }
 }

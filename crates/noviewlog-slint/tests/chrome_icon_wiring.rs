@@ -120,24 +120,34 @@ fn chrome_text_has_no_banned_icon_glyphs() {
 fn terminals_and_files_use_section_dot() {
     let app = ui_dir().join("app.slint");
     let src = fs::read_to_string(&app).unwrap();
+    // Both headers are `SidebarSectionHeader` (sidebar.slint), which owns the
+    // `SectionDot` disc; the host only picks the dot color.
+    let sidebar = fs::read_to_string(ui_dir().join("sidebar.slint")).unwrap();
+    let header = sidebar
+        .find("export component SidebarSectionHeader")
+        .expect("SidebarSectionHeader component");
+    let header_end = sidebar[header + 1..]
+        .find("export component")
+        .map_or(sidebar.len(), |off| header + 1 + off);
     assert!(
-        src.contains("SectionDot"),
+        sidebar[header..header_end].contains("SectionDot"),
         "TERMINALS/FILES markers must use SectionDot (colored disc), not Unicode"
     );
     let terminals = src
         .find("TERMINALS — collapsible")
         .expect("TERMINALS section");
     let files = src.find("FILES — collapsible").expect("FILES section");
-    // Header + SectionDot + fill-color span >900 bytes (Unicode comments).
-    let term_chunk = &src[terminals..terminals.saturating_add(1400).min(src.len())];
-    let files_chunk = &src[files..files.saturating_add(1400).min(src.len())];
+    let term_chunk = &src[terminals..terminals.saturating_add(500).min(src.len())];
+    let files_chunk = &src[files..files.saturating_add(500).min(src.len())];
     assert!(
-        term_chunk.contains("SectionDot") && term_chunk.contains("fill-color: Theme.accent"),
-        "TERMINALS header must use SectionDot with Theme.accent"
+        term_chunk.contains("SidebarSectionHeader")
+            && term_chunk.contains("dot-color: Theme.accent"),
+        "TERMINALS header must use SidebarSectionHeader with Theme.accent"
     );
     assert!(
-        files_chunk.contains("SectionDot") && files_chunk.contains("fill-color: Theme.include"),
-        "FILES header must use SectionDot with Theme.include"
+        files_chunk.contains("SidebarSectionHeader")
+            && files_chunk.contains("dot-color: Theme.include"),
+        "FILES header must use SidebarSectionHeader with Theme.include"
     );
     assert!(
         !src.contains("SectionChevron"),

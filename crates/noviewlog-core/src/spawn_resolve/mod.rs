@@ -1,5 +1,10 @@
 //! Resolve spawn argv before handing off to portable-pty.
 //!
+//! This module is the pure resolver (`prepare_spawn` and friends). The threaded,
+//! caching wrapper that parks work off the UI thread lives in
+//! [`crate::spawn_resolver`] — edit that crate module when the host needs async
+//! resolution, and edit here when the argv/cwd rules themselves change.
+//!
 //! On Windows, CreateProcessW (used by portable-pty) does **not** apply PATHEXT when
 //! `lpApplicationName` is a bare name like `node`. If PATH lookup also misses, the OS
 //! error is ERROR_FILE_NOT_FOUND (localized OS message, e.g. "file not found"). Node/npm installers
@@ -83,21 +88,7 @@ pub fn resolve_process_launch(
     }
 
     // Process mode: never silently run Windows tools against a WSL UNC mount.
-    if let Some(cwd) = launch
-        .cwd
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        if parse_wsl_unc(cwd).is_some() || is_unc_path(cwd) {
-            return Err(format!(
-                "Working directory looks like a WSL/UNC path ({cwd}). \
-                 Use launch mode **WSL** with a Linux path (e.g. /home/…), \
-                 not Process mode with \\\\wsl.localhost\\\\… — that runs Windows \
-                 node/pnpm against the UNC mount."
-            ));
-        }
-    }
+    reject_unc_cwd(launch.cwd.as_deref(), true)?;
 
     let command = launch
         .command
@@ -130,25 +121,39 @@ pub fn resolve_interactive_shell(
         return Ok((exe, args, Some(safe_windows_cwd())));
     }
 
-    if let Some(cwd) = launch
-        .cwd
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        if parse_wsl_unc(cwd).is_some() || is_unc_path(cwd) {
-            return Err(format!(
-                "Working directory looks like a WSL/UNC path ({cwd}). \
-                 Use launch mode **WSL** with a Linux path (e.g. /home/…)."
-            ));
-        }
-    }
+    reject_unc_cwd(launch.cwd.as_deref(), false)?;
 
     Ok((
         default_interactive_shell(shell),
         Vec::new(),
         launch.cwd.clone(),
     ))
+}
+
+/// Reject a WSL/UNC working directory that would break CreateProcess / ConPTY.
+///
+/// Process mode (`process_mode`) adds the extra hint about not mixing Windows
+/// tools with `\\wsl.localhost\…` mounts; interactive shell uses the shorter form.
+fn reject_unc_cwd(cwd: Option<&str>, process_mode: bool) -> Result<(), String> {
+    let Some(cwd) = cwd.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(());
+    };
+    if parse_wsl_unc(cwd).is_none() && !is_unc_path(cwd) {
+        return Ok(());
+    }
+    if process_mode {
+        Err(format!(
+            "Working directory looks like a WSL/UNC path ({cwd}). \
+             Use launch mode **WSL** with a Linux path (e.g. /home/…), \
+             not Process mode with \\\\wsl.localhost\\\\… — that runs Windows \
+             node/pnpm against the UNC mount."
+        ))
+    } else {
+        Err(format!(
+            "Working directory looks like a WSL/UNC path ({cwd}). \
+             Use launch mode **WSL** with a Linux path (e.g. /home/…)."
+        ))
+    }
 }
 /// Split a mistaken "cmd + args in Command" field, then platform-resolve the executable
 /// and (on Windows) sanitize cwd for ConPTY / WSL / cmd.exe.

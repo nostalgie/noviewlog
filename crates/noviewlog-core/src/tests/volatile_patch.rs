@@ -30,7 +30,6 @@ fn many_single_byte_feeds_patch_without_marking_dirty() {
     let format = get_builtin_format("generic");
     let mut parser = RecordParser::new(format);
     let mut ingest = TerminalIngest::new_with_size(80, 24);
-    ingest.ensure_live_screen(&mut buffer);
 
     let mut view = LogView::from_runtime(crate::TERMINAL_TAB_NAME, Vec::new());
     view.rebuild(&mut buffer);
@@ -82,7 +81,6 @@ fn patch_survives_ring_trim_under_cap() {
     let format = get_builtin_format("generic");
     let mut parser = RecordParser::new(format);
     let mut ingest = TerminalIngest::new_with_size(80, 10);
-    ingest.ensure_live_screen(&mut buffer);
 
     let mut view = LogView::from_runtime(crate::TERMINAL_TAB_NAME, Vec::new());
     view.rebuild(&mut buffer);
@@ -126,7 +124,6 @@ fn filter_tab_does_not_see_uncommitted_live_screen() {
     let format = get_builtin_format("generic");
     let mut parser = RecordParser::new(format);
     let mut ingest = TerminalIngest::new_with_size(80, 24);
-    ingest.ensure_live_screen(&mut buffer);
 
     let include = compile_filter(FilterRule {
         id: "inc-1".into(),
@@ -162,8 +159,7 @@ fn failed_patch_does_not_strip_overlay() {
 
     let mut buffer = RecordBuffer::new(50_000);
     seed_scrollback(&mut buffer, 50);
-    let mut ingest = TerminalIngest::new_with_size(80, 24);
-    ingest.ensure_live_screen(&mut buffer);
+    let ingest = TerminalIngest::new_with_size(80, 24);
 
     let include = compile_filter(FilterRule {
         id: "inc-1".into(),
@@ -201,7 +197,6 @@ fn first_patch_with_zero_overlay_len_keeps_committed_prefix() {
     let format = get_builtin_format("generic");
     let mut parser = RecordParser::new(format);
     let mut ingest = TerminalIngest::new_with_size(80, 24);
-    ingest.ensure_live_screen(&mut buffer);
 
     let mut view = LogView::from_runtime(crate::TERMINAL_TAB_NAME, Vec::new());
     view.rebuild(&mut buffer);
@@ -239,7 +234,6 @@ fn patch_survives_multiline_record_ring_trim() {
     let format = get_builtin_format("generic");
     let mut parser = RecordParser::new(format);
     let mut ingest = TerminalIngest::new_with_size(80, 5);
-    ingest.ensure_live_screen(&mut buffer);
 
     // Seed with 3-line records so record count and flat-line count diverge.
     for i in 0..30 {

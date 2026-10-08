@@ -7,9 +7,9 @@
 import { Chrome } from "./chrome";
 import { FiltersPanel } from "./filtersPanel";
 import type { HostToWebview } from "../protocol";
-import { isHostToWebview } from "../protocol";
+import { chunkInputData, isHostToWebview } from "../protocol";
 import { measureTheme, Renderer } from "./renderer";
-import { applyMessage } from "./state";
+import { applyMessage, emptyState, type SessionState } from "./state";
 
 declare global {
   interface Window {
@@ -40,9 +40,9 @@ const chrome = new Chrome(chromeRoot);
 const panel = new FiltersPanel(document.getElementById("side")!);
 
 // Empty state: shown while no session exists, explains how to start one.
-const emptyState = document.createElement("div");
-emptyState.id = "empty-state";
-emptyState.innerHTML = `
+const emptyEl = document.createElement("div");
+emptyEl.id = "empty-state";
+emptyEl.innerHTML = `
   <div class="empty-title">No active session</div>
   <div class="empty-hint">Run a command or open a log file:</div>
   <ul>
@@ -50,7 +50,10 @@ emptyState.innerHTML = `
     <li>Ctrl+Shift+P → <b>NoViewLog: Open Log File…</b></li>
   </ul>
   <div class="empty-hint">Tabs filter, Find only highlights. Use <b>+ Tab</b> and the <b>Filters</b> panel to show matching lines only.</div>`;
-document.body.appendChild(emptyState);
+document.body.appendChild(emptyEl);
+
+/** Canonical webview state; the views only receive it through `render()`. */
+let state: SessionState = emptyState();
 
 let lastScrollRequest = 0;
 /** Set on user scroll-up; blocks forced follow scrolls until the host
@@ -121,11 +124,10 @@ function apply(msg: HostToWebview): void {
     panel.setPresets(msg.presets);
     return;
   }
-  const state = applyMessage(chrome.state, msg);
-  chrome.state = state;
+  state = applyMessage(state, msg);
   chrome.render(state);
   panel.render(state);
-  emptyState.style.display = state.session ? "none" : "";
+  emptyEl.style.display = state.session ? "none" : "";
   const view = state.session?.view;
   renderer.setLines(view?.lines ?? [], view?.wrap ?? false);
   if (view) {
@@ -146,7 +148,7 @@ function apply(msg: HostToWebview): void {
 
 window.addEventListener("message", (event: MessageEvent) => {
   // VS Code delivers messages from other sources too; an unrecognized shape
-  // must not reach the state pipeline (it would corrupt chrome.state).
+  // must not reach the state pipeline (it would corrupt `state`).
   if (isHostToWebview(event.data)) {
     apply(event.data);
     syncCaret();
@@ -163,7 +165,7 @@ const reportResize = () => {
   const cols = Math.max(1, Math.floor(scroller.clientWidth / initialTheme.charWidth));
   const rows = Math.max(1, Math.floor(scroller.clientHeight / initialTheme.lineHeight));
   postToHost({ type: "resize", cols, rows });
-  renderer.relayout(chrome.state.session?.view.wrap ?? false);
+  renderer.relayout(state.session?.view.wrap ?? false);
 };
 let resizeTimer: number | undefined;
 const onResize = () => {
@@ -173,9 +175,10 @@ const onResize = () => {
 window.addEventListener("resize", onResize);
 new ResizeObserver(onResize).observe(scroller);
 
-// Scroll-up releases Follow; back at the bottom it re-engages.
+// Scrolling up away from the bottom releases Follow (setFollow(false)).
+// Reaching the bottom again does not re-engage it; only the Follow toggle does.
 scroller.addEventListener("scroll", () => {
-  const follow = chrome.state.session?.view.follow ?? false;
+  const follow = state.session?.view.follow ?? false;
   const atBottom = scroller.scrollTop + scroller.clientHeight >= renderer.totalHeight - 4;
   if (follow && !atBottom && !followReleased) {
     followReleased = true;
@@ -188,7 +191,7 @@ scroller.addEventListener("scroll", () => {
 // The canvas has no text field: keystrokes are translated to VT sequences
 // and written straight to the PTY, like a real terminal.
 const terminalTabActive = (): boolean => {
-  const session = chrome.state.session;
+  const session = state.session;
   if (!session) {
     return false;
   }
@@ -196,7 +199,7 @@ const terminalTabActive = (): boolean => {
 };
 
 const sessionModes = (): { mouse: boolean; bracketed: boolean } => {
-  const session = chrome.state.session;
+  const session = state.session;
   return {
     mouse: session?.mouse_tracking ?? false,
     bracketed: session?.bracketed_paste ?? false,
@@ -211,7 +214,7 @@ let blinkTimer: number | undefined;
 let blinkLit = true;
 
 const syncCaret = (): void => {
-  const session = chrome.state.session;
+  const session = state.session;
   const ready =
     terminalTabActive() &&
     document.activeElement === scroller &&
@@ -372,11 +375,12 @@ scroller.addEventListener("paste", (event: ClipboardEvent) => {
   const text = event.clipboardData?.getData("text");
   if (text) {
     event.preventDefault();
-    const data = text.slice(0, 4096);
-    postToHost({
-      type: "input",
-      data: sessionModes().bracketed ? `\x1b[200~${data}\x1b[201~` : data,
-    });
+    // Bracket the whole paste, then chunk so each host message stays within
+    // MAX_INPUT_CHARS (issue #330). Sequential writes keep one paste stream.
+    const payload = sessionModes().bracketed ? `\x1b[200~${text}\x1b[201~` : text;
+    for (const data of chunkInputData(payload)) {
+      postToHost({ type: "input", data });
+    }
   }
 });
 

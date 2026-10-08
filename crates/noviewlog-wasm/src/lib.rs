@@ -71,7 +71,8 @@ impl WebEngine {
         Ok(())
     }
 
-    pub fn session(&self, id: u32) -> Result<bool, String> {
+    /// Whether a session with this id is currently open (existence check, not a getter).
+    pub fn session_exists(&self, id: u32) -> Result<bool, String> {
         Ok(self.sessions.iter().any(|s| s.id == id))
     }
 

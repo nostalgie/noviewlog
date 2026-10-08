@@ -3,12 +3,15 @@
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
+use noviewlog_core::core::types::{
+    DEFAULT_VIEWPORT_FONT_SIZE, MAX_VIEWPORT_FONT_SIZE, MIN_VIEWPORT_FONT_SIZE,
+};
 use noviewlog_core::{Command, Engine};
 use slint::{ComponentHandle, Image, Rgba8Pixel, SharedPixelBuffer, Timer, Weak};
 
 use crate::caret::sync_terminal_caret;
 use crate::ctx::Ctx;
-use crate::engine_bridge::bump_fast_timer;
+use crate::engine_bridge::{bump_fast_timer, device_size};
 use noviewlog_slint::ui::AppWindow;
 
 /// Placeholder fill matching `Theme.bg-window` (`#0d1117`) so the first `Image`
@@ -95,15 +98,13 @@ pub(crate) fn apply_viewport_focus(
 ) {
     let _ = eng.send_command(Command::SetViewportFocus { focused });
     if focused {
-        eng.reset_caret_blink();
         force_render.set(true);
         bump_fast_timer(timer, timer_fast);
         if let Some(ui) = ui.upgrade() {
             ui.set_caret_blink_on(true);
-            let (lw, lh) = *logical_size.borrow();
+            let logical = *logical_size.borrow();
             let scale = ui.window().scale_factor().max(0.5) as f32;
-            let width = (lw * scale).ceil().max(1.0) as u32;
-            let height = (lh * scale).ceil().max(1.0) as u32;
+            let (width, height) = device_size(logical, scale);
             let _ = sync_terminal_caret(&ui, eng, width, height, scale);
         }
     } else if let Some(ui) = ui.upgrade() {
@@ -123,7 +124,8 @@ pub(crate) fn install_zoom(ui: &AppWindow, ctx: &Ctx, viewport_font_size: Rc<Cel
         let ctx = ctx.clone();
         let viewport_font_size = viewport_font_size.clone();
         ui.on_zoom_in(move || {
-            let next = (viewport_font_size.get() + 1.0).clamp(8.0, 32.0);
+            let next = (viewport_font_size.get() + 1.0)
+                .clamp(MIN_VIEWPORT_FONT_SIZE, MAX_VIEWPORT_FONT_SIZE);
             apply_zoom(&ctx, &viewport_font_size, next);
         });
     }
@@ -131,7 +133,8 @@ pub(crate) fn install_zoom(ui: &AppWindow, ctx: &Ctx, viewport_font_size: Rc<Cel
         let ctx = ctx.clone();
         let viewport_font_size = viewport_font_size.clone();
         ui.on_zoom_out(move || {
-            let next = (viewport_font_size.get() - 1.0).clamp(8.0, 32.0);
+            let next = (viewport_font_size.get() - 1.0)
+                .clamp(MIN_VIEWPORT_FONT_SIZE, MAX_VIEWPORT_FONT_SIZE);
             apply_zoom(&ctx, &viewport_font_size, next);
         });
     }
@@ -139,7 +142,7 @@ pub(crate) fn install_zoom(ui: &AppWindow, ctx: &Ctx, viewport_font_size: Rc<Cel
         let ctx = ctx.clone();
         let viewport_font_size = viewport_font_size.clone();
         ui.on_zoom_reset(move || {
-            apply_zoom(&ctx, &viewport_font_size, 13.0);
+            apply_zoom(&ctx, &viewport_font_size, DEFAULT_VIEWPORT_FONT_SIZE);
         });
     }
     {
@@ -151,7 +154,8 @@ pub(crate) fn install_zoom(ui: &AppWindow, ctx: &Ctx, viewport_font_size: Rc<Cel
                 return;
             }
             let step = if delta_y > 0.0 { 1.0 } else { -1.0 };
-            let next = (viewport_font_size.get() + step).clamp(8.0, 32.0);
+            let next = (viewport_font_size.get() + step)
+                .clamp(MIN_VIEWPORT_FONT_SIZE, MAX_VIEWPORT_FONT_SIZE);
             if (next - viewport_font_size.get()).abs() < f32::EPSILON {
                 return;
             }
@@ -186,7 +190,12 @@ pub(crate) fn install_follow(ui: &AppWindow, ctx: &Ctx, syncing_follow: Rc<Cell<
     });
 }
 
-pub(crate) fn install_scroll(ui: &AppWindow, ctx: &Ctx, syncing_scroll: Rc<Cell<bool>>) {
+pub(crate) fn install_scroll(
+    ui: &AppWindow,
+    ctx: &Ctx,
+    syncing_scroll: Rc<Cell<bool>>,
+    scrollbar_drag_active: Rc<Cell<bool>>,
+) {
     {
         let ctx = ctx.clone();
         ui.on_viewport_scrolled(move |delta_y| {
@@ -228,6 +237,12 @@ pub(crate) fn install_scroll(ui: &AppWindow, ctx: &Ctx, syncing_scroll: Rc<Cell<
                 return;
             }
             ctx.send_refresh(Command::SetScrollX { offset: value });
+        });
+    }
+    {
+        let scrollbar_drag_active = scrollbar_drag_active.clone();
+        ui.on_viewport_scrollbar_drag_active(move |active| {
+            scrollbar_drag_active.set(active);
         });
     }
 }

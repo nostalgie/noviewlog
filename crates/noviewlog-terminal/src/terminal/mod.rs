@@ -193,14 +193,16 @@ impl Perform for TerminalEmulator {
         let private = intermediates.contains(&b'?');
         match action {
             'm' if !private => {
-                let mut codes: Vec<u16> = Vec::new();
-                for p in params.iter() {
-                    if p.is_empty() {
-                        codes.push(0);
-                    } else {
-                        codes.extend_from_slice(p);
-                    }
-                }
+                // Map colon subparameters through the same SGR grammar the
+                // line stack uses (#318): `4:0` is underline-off (not
+                // underline-on + pen reset), and `38:2:<cs>:r:g:b` consumes
+                // the colorspace id.
+                let groups: Vec<Vec<u32>> = params
+                    .iter()
+                    .map(|p| p.iter().map(|&x| u32::from(x)).collect())
+                    .collect();
+                let refs: Vec<&[u32]> = groups.iter().map(|g| g.as_slice()).collect();
+                let codes = crate::ansi::sgr_codes_from_groups(&refs);
                 self.apply_sgr(&codes);
             }
             'h' if private => {
@@ -556,13 +558,12 @@ impl TerminalIngest {
         self.emu.screen_lines()
     }
 
-    /// Ensure the live screen exists even before the first PTY byte (empty
-    /// grid with a visible caret at 0,0). Does not write Records.
-    pub fn ensure_live_screen(&mut self, _buffer: &mut RecordBuffer) {}
-
     /// Number of live overlay lines (not stored in the Record buffer).
+    /// Grid walk without building the projection — the caret path calls
+    /// this per rendered frame (issue #331); a parity test pins it to
+    /// [`Self::overlay_flat_lines`].
     pub fn volatile_count(&self) -> usize {
-        self.emu.overlay_flat_lines().len()
+        self.emu.overlay_line_count()
     }
 
     /// Live overlay `FlatLine`s for scrollback composition (not the Follow paint path).
@@ -889,6 +890,52 @@ mod tests {
     }
 
     #[test]
+    fn colon_sgr_underline_off_does_not_reset_pen() {
+        // Issue #318: `4:0` is "underline off" (ITU T.416); its flat
+        // equivalent is `24`. Flattening the colon group into `4;0` turned
+        // underline on and then reset the whole pen, dropping fg/bold.
+        let mut emu = TerminalEmulator::new(80, 24);
+        feed(&mut emu, b"\x1b[31;1;4mred\x1b[4:0mmore\x1b[0m");
+        let (segments, _) = TerminalEmulator::row_to_segments(&emu.screen[0]);
+        let more = segments
+            .iter()
+            .find(|s| s.text == "more")
+            .unwrap_or_else(|| panic!("segment \"more\" in {segments:?}"));
+        let style = more.style.as_ref().unwrap();
+        assert!(!style.underline, "4:0 clears underline");
+        assert!(style.bold, "4:0 must not reset bold: {style:?}");
+        // Basic 31 in the terminal palette.
+        assert_eq!(style.fg, Some((248, 81, 73)), "4:0 must not reset fg");
+    }
+
+    #[test]
+    fn vt_sgr_truecolor_colorspace_form_and_clamping() {
+        // Issue #318: the VT stack must match the line stack — truecolor
+        // values clamp at 255, and ITU T.416 `38:2:<colorspace>:r:g:b`
+        // consumes the colorspace id instead of reading it as red.
+        let mut emu = TerminalEmulator::new(80, 24);
+        feed(
+            &mut emu,
+            b"\x1b[38;2;300;0;0mA\x1b[0m\x1b[38:2:1:0:128:0mB\x1b[0m",
+        );
+        let (segments, _) = TerminalEmulator::row_to_segments(&emu.screen[0]);
+        let find = |needle: &str| {
+            segments
+                .iter()
+                .find(|s| s.text == needle)
+                .unwrap_or_else(|| panic!("segment {needle} in {segments:?}"))
+        };
+        let a = find("A").style.as_ref().and_then(|s| s.fg);
+        let b = find("B").style.as_ref().and_then(|s| s.fg);
+        assert_eq!(a, Some((255, 0, 0)), "truecolor clamps at 255, got {a:?}");
+        assert_eq!(
+            b,
+            Some((0, 128, 0)),
+            "colorspace form reads r:g:b after the id, got {b:?}"
+        );
+    }
+
+    #[test]
     fn echo_does_not_create_records() {
         let mut ingest = TerminalIngest::new_with_size(80, 24);
         let mut buffer = RecordBuffer::new(1000);
@@ -917,5 +964,44 @@ mod tests {
         let line = emu.screen_lines().remove(0);
         // ...the leftover continuation must not render the leader's glyph.
         assert_eq!(line, "echo 中");
+    }
+}
+#[cfg(test)]
+mod volatile_count_parity_tests {
+    use super::*;
+    use vte::Parser;
+
+    fn feed(emu: &mut TerminalEmulator, bytes: &[u8]) {
+        let mut parser = Parser::new();
+        parser.advance(emu, bytes);
+    }
+
+    #[test]
+    fn volatile_count_matches_projection_across_scenarios() {
+        // Issue #331: the cheap grid walk must stay in lockstep with the
+        // full overlay projection (prompt, wraps, colors, blanks, cursor
+        // placement, clears, unicode) — drift here corrupts the caret and
+        // scroll math.
+        let scenarios: &[&str] = &[
+            "",
+            "prompt$ ",
+            "line one\r\nline two\r\nline three",
+            "\u{1b}[31mred\u{1b}[0m plain\r\n\u{1b}[1;4mbold underline\u{1b}[0m",
+            "averylongline_that_wraps_across_many_columns_and_keeps_going_and_going_and_going\r\nnext",
+            "top\r\n\r\n\r\nbottom",
+            "row1\r\nrow2\r\n\u{1b}[5;10Hcursor moved",
+            "fill\u{1b}[2Jcleared",
+            "unicode: h\u{e9}llo \u{4f60}\u{597d} end",
+            "first\r\n\u{1b}[10;1Hjumped down\r\nmore\u{1b}[3;1Hup",
+        ];
+        for (i, input) in scenarios.iter().enumerate() {
+            let mut emu = TerminalEmulator::new(40, 8);
+            feed(&mut emu, input.as_bytes());
+            assert_eq!(
+                emu.overlay_line_count(),
+                emu.overlay_flat_lines().len(),
+                "scenario {i} ({input:?}) diverged"
+            );
+        }
     }
 }

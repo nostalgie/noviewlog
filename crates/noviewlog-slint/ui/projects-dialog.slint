@@ -6,10 +6,13 @@
 
 import { Theme } from "theme.slint";
 import { ProjectInfo } from "types.slint";
-import { AppButton, FormTextField } from "form-dialogs.slint";
+import { AppButton, FormTextField, DialogFrame, DialogTitle, DialogFooter } from "form-dialogs.slint";
 import { TerminalRowIcon } from "sidebar.slint";
 
-export component ProjectsDialog inherits Rectangle {
+// Frame, title, footer row and padding/spacing/min-width reuse the FormDialogPanel
+// recipe (DialogFrame / DialogTitle / DialogFooter / Theme.dialog-*); the body here
+// is mode-dependent, so the panel itself cannot host it.
+export component ProjectsDialog inherits DialogFrame {
     in property <[ProjectInfo]> projects;
     callback closed();
     callback project-open(id: string);
@@ -22,14 +25,6 @@ export component ProjectsDialog inherits Rectangle {
     in-out property <string> rename-id: "";
     // Issue #82: delete needs an explicit confirm step before the engine call.
     in-out property <string> delete-id: "";
-
-    background: Theme.bg-window;
-    border-width: 1px;
-    border-color: Theme.border;
-    border-radius: 0px;
-    drop-shadow-color: Theme.shadow-panel;
-    drop-shadow-offset-y: 8px;
-    drop-shadow-blur: 20px;
 
     init => {
         // Issue #107: focus the dialog key scope when the popup is shown so
@@ -87,7 +82,16 @@ export component ProjectsDialog inherits Rectangle {
         height: 100%;
 
         key-pressed(event) => {
-            if (event.text == Key.Escape) {
+            // Enter confirms in confirm-delete (no text field); create/rename use
+            // FormTextField.accepted. Matches FormDialogPanel (#333).
+            if (event.text == Key.Return || event.text == "\n") {
+                if (root.dialog-mode == "confirm-delete") {
+                    root.confirm-form();
+                    accept
+                } else {
+                    reject
+                }
+            } else if (event.text == Key.Escape) {
                 if (root.dialog-mode == "list") {
                     root.closed();
                 } else {
@@ -100,19 +104,16 @@ export component ProjectsDialog inherits Rectangle {
         }
 
         VerticalLayout {
-            padding: 20px;
-            spacing: 16px;
-            min-width: 420px;
+            padding: Theme.dialog-pad;
+            spacing: Theme.dialog-spacing;
+            min-width: Theme.dialog-min-width;
 
             HorizontalLayout {
                 spacing: 8px;
                 alignment: stretch;
 
-                Text {
+                DialogTitle {
                     text: root.panel-title;
-                    color: Theme.text-primary;
-                    font-size: 14px;
-                    font-weight: 700;
                     vertical-alignment: center;
                     horizontal-stretch: 1;
                 }
@@ -216,11 +217,7 @@ export component ProjectsDialog inherits Rectangle {
                     }
                 }
 
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: end;
-                    padding-top: 4px;
-
+                DialogFooter {
                     AppButton {
                         text: "Close";
                         primary: true;
@@ -230,7 +227,7 @@ export component ProjectsDialog inherits Rectangle {
             }
 
             if root.dialog-mode != "list": VerticalLayout {
-                spacing: 16px;
+                spacing: Theme.dialog-spacing;
                 width: 100%;
 
                 if root.dialog-mode == "confirm-delete": Text {
@@ -248,11 +245,7 @@ export component ProjectsDialog inherits Rectangle {
                     cancelled => { root.cancel-form(); }
                 }
 
-                HorizontalLayout {
-                    spacing: 8px;
-                    alignment: end;
-                    padding-top: 4px;
-
+                DialogFooter {
                     AppButton {
                         text: "Cancel";
                         clicked => { root.cancel-form(); }

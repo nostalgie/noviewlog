@@ -34,22 +34,37 @@ export global Theme {
     out property <color> text-secondary: #8b949e;
     out property <color> text-muted: #6e7681;
 
-    // Spacing / radius / chrome geometry tokens.
-    out property <length> space-xs: 2px;
-    out property <length> space-sm: 4px;
-    out property <length> space-md: 8px;
-    out property <length> space-lg: 12px;
-    out property <length> space-xl: 16px;
+    // Shared chrome geometry tokens (only values restated across components).
     // Dialog / form TextInput inset (match Settings SpinBox: even L/T/R inside the box).
     out property <length> field-height: 32px;
     out property <length> field-pad-x: 10px;
     out property <length> field-pad-y: 8px;
-    out property <length> radius-sm: 4px;
-    out property <length> radius-md: 6px;
     out property <length> title-strip: 32px;
+    // Thin winit edge grip; keep small so the top edge does not steal menu clicks.
     out property <length> resize-border: 2px;
     // Centered File/dialog overlays (Projects, Edit launch, Settings, About).
     out property <length> overlay-width: 460px;
+    // Min distance from the window top; overlays center on their own measured height.
+    out property <length> overlay-margin-top: 48px;
+    // Dialog frame recipe shared by FormDialogPanel and ProjectsDialog.
+    out property <length> dialog-pad: 20px;
+    out property <length> dialog-spacing: 16px;
+    out property <length> dialog-min-width: 420px;
+
+    // Chrome menu rows. A flyout panel is 4px padding + rows + separators.
+    out property <length> menu-item-height: 32px;
+    out property <length> menu-separator-height: 9px;
+    out property <length> menu-panel-padding: 4px;
+    public pure function menu-flyout-height(items: int, seps: int) -> length {
+        return 2 * Theme.menu-panel-padding
+            + Theme.menu-item-height * items
+            + Theme.menu-separator-height * seps;
+    }
+
+    // Sidebar list rows (TERMINALS / FILES): height + gap = drag pitch.
+    out property <length> terminal-row-height: 44px;
+    out property <length> terminal-row-gap: 3px;
+    out property <length> terminal-row-pitch: Theme.terminal-row-height + Theme.terminal-row-gap;
     out property <color> shadow-menu: #00000042;
     out property <color> shadow-panel: #00000055;
 

@@ -75,7 +75,6 @@ pub fn builtin_format_presets() -> HashMap<String, FormatPreset> {
 pub fn create_log_format(id: &str, preset: &FormatPreset) -> LogFormat {
     LogFormat {
         id: id.to_string(),
-        name: id.to_string(),
         start: preset.start.clone(),
         continuation: preset.continuation.clone(),
         start_regex: Some(compile_regex(&preset.start)),
@@ -89,11 +88,15 @@ pub fn create_log_format(id: &str, preset: &FormatPreset) -> LogFormat {
 
 pub fn get_builtin_format(id: &str) -> LogFormat {
     let presets = builtin_format_presets();
-    let preset = presets
-        .get(id)
-        .or_else(|| presets.get("node-default"))
-        .expect("node-default format exists");
-    create_log_format(id, preset)
+    // Unknown ids fall back to node-default behavior *and* identity so
+    // special-cases like `id == "raw"` cannot lie about the active format.
+    let resolved = if presets.contains_key(id) {
+        id
+    } else {
+        "node-default"
+    };
+    let preset = presets.get(resolved).expect("node-default format exists");
+    create_log_format(resolved, preset)
 }
 
 pub fn merge_formats(

@@ -7,7 +7,8 @@
  */
 
 import type { WebviewToHost } from "../protocol";
-import { searchBadge, type SessionState } from "./state";
+import { button, el, toggleButton } from "./dom";
+import { emptyState, searchBadge, type SessionState } from "./state";
 
 export class Chrome {
   private root: HTMLElement;
@@ -16,9 +17,13 @@ export class Chrome {
   private findLabel: HTMLElement;
   private exitLabel: HTMLElement;
   private panelToggleBtn: HTMLButtonElement;
+  private regexBtn: HTMLButtonElement;
+  private caseBtn: HTMLButtonElement;
+  private wordBtn: HTMLButtonElement;
   private renderedTabs: unknown;
+  private findDebounce: number | undefined;
 
-  state: SessionState = { session: null, exitStatus: null };
+  private state: SessionState = emptyState();
   onCommand: ((cmd: WebviewToHost) => void) | null = null;
   onTogglePanel: (() => void) | null = null;
 
@@ -31,13 +36,13 @@ export class Chrome {
     this.findInput.placeholder = "Find (highlights matches)";
     this.findInput.spellcheck = false;
 
-    const regexBtn = toggleButton(".*", "Regular expression", false, (on) =>
+    this.regexBtn = toggleButton(".*", "Regular expression", false, (on) =>
       this.sendSearch({ regex: on }),
     );
-    const caseBtn = toggleButton("Aa", "Match case", false, (on) =>
+    this.caseBtn = toggleButton("Aa", "Match case", false, (on) =>
       this.sendSearch({ caseSensitive: on }),
     );
-    const wordBtn = toggleButton("|w", "Whole word", false, (on) =>
+    this.wordBtn = toggleButton("|w", "Whole word", false, (on) =>
       this.sendSearch({ wholeWord: on }),
     );
 
@@ -45,13 +50,17 @@ export class Chrome {
     const nextBtn = button(">", "Next match (Enter)", () => this.send({ type: "searchNext" }));
     this.findLabel = el("span", "find-label");
 
-    let debounce: number | undefined;
     this.findInput.addEventListener("input", () => {
-      window.clearTimeout(debounce);
-      debounce = window.setTimeout(() => this.sendSearch({}), 200);
+      window.clearTimeout(this.findDebounce);
+      this.findDebounce = window.setTimeout(() => this.sendSearch({}), 200);
     });
     this.findInput.addEventListener("keydown", (e) => {
       if (e.key === "Enter") {
+        // Flush pending debounce so Next/Prev run against the typed query,
+        // not the host's stale one (issue #328).
+        window.clearTimeout(this.findDebounce);
+        this.findDebounce = undefined;
+        this.sendSearch({});
         this.send(e.shiftKey ? { type: "searchPrev" } : { type: "searchNext" });
       }
     });
@@ -62,7 +71,15 @@ export class Chrome {
     );
 
     const find = el("div", "find");
-    find.append(this.findInput, regexBtn, caseBtn, wordBtn, prevBtn, nextBtn, this.findLabel);
+    find.append(
+      this.findInput,
+      this.regexBtn,
+      this.caseBtn,
+      this.wordBtn,
+      prevBtn,
+      nextBtn,
+      this.findLabel,
+    );
     this.exitLabel = el("span", "exit-label");
     const controls = el("div", "controls");
     controls.append(find, this.exitLabel, addTabBtn, this.panelToggleBtn);
@@ -131,38 +148,15 @@ export class Chrome {
 
     this.exitLabel.textContent = state.exitStatus ?? "";
     this.exitLabel.style.display = state.exitStatus ? "" : "none";
-    this.findLabel.textContent = searchBadge(session.view.search);
+    const search = session.view.search;
+    this.findLabel.textContent = searchBadge(search);
     if (document.activeElement !== this.findInput) {
-      this.findInput.value = session.view.search.query;
+      this.findInput.value = search.query;
     }
+    // Keep toggle indicators honest across webview recreate / snapshot sync
+    // (issue #328) — they were only set at construction and on click.
+    this.regexBtn.setAttribute("aria-pressed", String(search.regex));
+    this.caseBtn.setAttribute("aria-pressed", String(search.case_sensitive));
+    this.wordBtn.setAttribute("aria-pressed", String(search.whole_word));
   }
-}
-
-function el(tag: string, className: string): HTMLElement {
-  const e = document.createElement(tag);
-  e.className = className;
-  return e;
-}
-
-function button(label: string, title: string, onClick: () => void): HTMLButtonElement {
-  const b = document.createElement("button");
-  b.textContent = label;
-  b.title = title;
-  b.onclick = onClick;
-  return b;
-}
-
-function toggleButton(
-  label: string,
-  title: string,
-  initial: boolean,
-  onChange: (on: boolean) => void,
-): HTMLButtonElement {
-  const b = button(label, title, () => {
-    const on = b.getAttribute("aria-pressed") !== "true";
-    b.setAttribute("aria-pressed", String(on));
-    onChange(on);
-  });
-  b.setAttribute("aria-pressed", String(initial));
-  return b;
 }

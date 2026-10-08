@@ -17,71 +17,45 @@ fn engine_isolated() -> Engine {
 #[test]
 fn project_open_selects_terminal_tab_and_stays_stopped() {
     let mut engine = engine_isolated();
+    let mut project = sample_project("project-1", "Demo");
+    project.programs[0].launch.cwd = Some("/tmp".into());
+    project.programs[0].workspace = WorkspaceConfig {
+        tabs: vec![
+            TabConfig {
+                name: "Terminal".into(),
+                filters: vec![],
+                search_query: String::new(),
+                search_regex: false,
+                search_case_sensitive: false,
+                search_whole_word: false,
+                auto_follow: true,
+                wrap_lines: true,
+                severity: Default::default(),
+            },
+            TabConfig {
+                name: "Errors".into(),
+                filters: vec![FilterRule {
+                    id: "f1".into(),
+                    name: None,
+                    filter_type: FilterType::Include,
+                    pattern: "error".into(),
+                    enabled: true,
+                    use_regex: false,
+                    regex: None,
+                }],
+                search_query: String::new(),
+                search_regex: false,
+                search_case_sensitive: false,
+                search_whole_word: false,
+                auto_follow: true,
+                wrap_lines: true,
+                severity: Default::default(),
+            },
+        ],
+        active_tab: 1,
+    };
     engine.projects = ProjectsStore {
-        projects: vec![ProjectConfig {
-            id: "project-1".into(),
-            name: "Demo".into(),
-            default_cwd: None,
-            path_hint: None,
-            programs: vec![
-                ProgramConfig {
-                    id: "program-a".into(),
-                    name: "API".into(),
-                    launch: LaunchConfig {
-                        command: Some("echo".into()),
-                        args: vec!["hello".into()],
-                        cwd: Some("/tmp".into()),
-                        ..LaunchConfig::default()
-                    },
-                    workspace: WorkspaceConfig {
-                        tabs: vec![
-                            TabConfig {
-                                name: "Terminal".into(),
-                                filters: vec![],
-                                search_query: String::new(),
-                                search_regex: false,
-                                search_case_sensitive: false,
-                                search_whole_word: false,
-                                auto_follow: true,
-                                wrap_lines: true,
-                                severity: Default::default(),
-                            },
-                            TabConfig {
-                                name: "Errors".into(),
-                                filters: vec![FilterRule {
-                                    id: "f1".into(),
-                                    name: None,
-                                    filter_type: FilterType::Include,
-                                    pattern: "error".into(),
-                                    enabled: true,
-                                    use_regex: false,
-                                    regex: None,
-                                }],
-                                search_query: String::new(),
-                                search_regex: false,
-                                search_case_sensitive: false,
-                                search_whole_word: false,
-                                auto_follow: true,
-                                wrap_lines: true,
-                                severity: Default::default(),
-                            },
-                        ],
-                        active_tab: 1,
-                    },
-                },
-                ProgramConfig {
-                    id: "program-b".into(),
-                    name: "Worker".into(),
-                    launch: LaunchConfig {
-                        command: Some("sleep".into()),
-                        args: vec!["1".into()],
-                        ..LaunchConfig::default()
-                    },
-                    workspace: WorkspaceConfig::default(),
-                },
-            ],
-            active_program: 0,
-        }],
+        projects: vec![project],
         active_project: 0,
     };
 

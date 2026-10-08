@@ -26,7 +26,9 @@ pub struct ViewportCaret {
 }
 
 pub struct ViewportMetrics {
+    /// Paint / caret box height in pixels (currently identical to [`Self::row_stride`]).
     pub row_height: f32,
+    /// Vertical scroll advance per visual row in pixels (same value as [`Self::row_height`] today).
     pub row_stride: f32,
     pub ascent: f32,
     /// Fixed terminal cell width in whole pixels (every column advances by this amount).
@@ -239,7 +241,6 @@ impl ViewportRenderer {
                 lines,
                 &visual_lines,
                 c,
-                0,
                 y_offset,
                 x_base,
                 self.metrics.row_stride,
@@ -262,11 +263,15 @@ impl ViewportRenderer {
 }
 
 /// Pixel position (x, row_top) of a block caret within the viewport.
+///
+/// `visual_lines` must be a **visible-only** slice whose index 0 is the top
+/// on-screen row (callers pass the `collect_visible` result). Row geometry uses
+/// that slice index — never an absolute scrolled row — so there is no
+/// `first_row` parameter (passing one would invite a silent off-by-scroll bug).
 pub fn caret_pixel_pos(
     lines: &[FlatLine],
     visual_lines: &[crate::viewport_layout::VisualLine],
     caret: ViewportCaret,
-    first_row: usize,
     y_offset: f32,
     x_base: i32,
     row_stride: f32,
@@ -294,10 +299,7 @@ pub fn caret_pixel_pos(
         if !in_slice {
             continue;
         }
-        if vis_i < first_row {
-            return None;
-        }
-        let row_top = -y_offset + (vis_i - first_row) as f32 * row_stride;
+        let row_top = -y_offset + vis_i as f32 * row_stride;
         if row_top >= height as f32 {
             return None;
         }
@@ -416,66 +418,10 @@ fn draw_visual_line(
             highlight_selection_in_segments(&segments, sel, flat_index, slice_start, slice_end);
     }
 
-    // Non-selectable muted gutter on the first visual row of a leveled Record.
-    // Does not insert characters into `raw` / selection / copy text.
-    // Sit in LEFT_PAD with a few pixels of gap so the bar does not glue to glyphs.
-    const SEVERITY_TEXT_GAP: i32 = 3;
-    let paint_level = line.level.or_else(|| detect_level(&line.raw));
     if slice_start == 0 {
-        if let Some(level) = paint_level {
-            let color = severity_cue_color(level);
-            let gutter_w = ((cell_width / 3).clamp(2, 4)) as usize;
-            let y = row_top.floor() as i32;
-            let h = row_height.ceil().max(1.0) as usize;
-            let gutter_x = x_base - SEVERITY_TEXT_GAP - gutter_w as i32;
-            fill_rect(
-                out,
-                width,
-                height,
-                gutter_x,
-                y,
-                gutter_w,
-                h,
-                color,
-                Some(clip),
-            );
-        }
-        // Disclosure cue for multiline Records (collapsed vs expanded).
-        if line.collapsible && line.line_index == 0 {
-            let color = if line.collapsed {
-                DISCLOSURE_COLLAPSED
-            } else {
-                DISCLOSURE_EXPANDED
-            };
-            let cue_w = ((cell_width / 2).clamp(3, 5)) as usize;
-            let y = row_top.floor() as i32;
-            let h = row_height.ceil().max(1.0) as usize;
-            // Keep disclosure in the pad, left of text (and left of severity when both exist).
-            let gutter_w = ((cell_width / 3).clamp(2, 4)) as i32;
-            let cue_x = if paint_level.is_some() {
-                x_base - SEVERITY_TEXT_GAP - gutter_w - 1 - cue_w as i32
-            } else {
-                x_base - SEVERITY_TEXT_GAP - cue_w as i32
-            };
-            fill_rect(out, width, height, cue_x, y, cue_w, h, color, Some(clip));
-            // Collapsed preview: muted "+N" suffix via small right-side hash marks.
-            if line.collapsed && line.hidden_line_count > 0 {
-                let mark_x = x_base + (width as i32).saturating_sub(cell_width as i32 * 4);
-                if mark_x > x_base {
-                    fill_rect(
-                        out,
-                        width,
-                        height,
-                        mark_x,
-                        y + (h as i32 / 3),
-                        (cell_width as usize).saturating_mul(2).min(16),
-                        (h / 3).max(2),
-                        DISCLOSURE_COLLAPSED,
-                        Some(clip),
-                    );
-                }
-            }
-        }
+        draw_row_decorations(
+            out, width, height, x_base, row_top, row_height, clip, line, cell_width,
+        );
     }
 
     let mut cursor_x = x_base;
@@ -517,6 +463,79 @@ fn draw_visual_line(
         }
     }
 }
+
+/// Severity bar, disclosure cue, and collapsed "+N" preview marks in LEFT_PAD.
+///
+/// Non-selectable muted gutter on the first visual row of a leveled / collapsible
+/// Record — does not insert characters into `raw` / selection / copy text.
+fn draw_row_decorations(
+    out: &mut [u8],
+    width: u32,
+    height: u32,
+    x_base: i32,
+    row_top: f32,
+    row_height: f32,
+    clip: (f32, f32),
+    line: &FlatLine,
+    cell_width: u32,
+) {
+    // Sit in LEFT_PAD with a few pixels of gap so the bar does not glue to glyphs.
+    const SEVERITY_TEXT_GAP: i32 = 3;
+    let paint_level = line.level.or_else(|| detect_level(&line.raw));
+    let gutter_w = (cell_width / 3).clamp(2, 4) as i32;
+    let y = row_top.floor() as i32;
+    let h = row_height.ceil().max(1.0) as usize;
+
+    if let Some(level) = paint_level {
+        let color = severity_cue_color(level);
+        let gutter_x = x_base - SEVERITY_TEXT_GAP - gutter_w;
+        fill_rect(
+            out,
+            width,
+            height,
+            gutter_x,
+            y,
+            gutter_w as usize,
+            h,
+            color,
+            Some(clip),
+        );
+    }
+    // Disclosure cue for multiline Records (collapsed vs expanded).
+    if line.collapsible && line.line_index == 0 {
+        let color = if line.collapsed {
+            DISCLOSURE_COLLAPSED
+        } else {
+            DISCLOSURE_EXPANDED
+        };
+        let cue_w = (cell_width / 2).clamp(3, 5) as usize;
+        // Keep disclosure in the pad, left of text (and left of severity when both exist).
+        let cue_x = if paint_level.is_some() {
+            x_base - SEVERITY_TEXT_GAP - gutter_w - 1 - cue_w as i32
+        } else {
+            x_base - SEVERITY_TEXT_GAP - cue_w as i32
+        };
+        fill_rect(out, width, height, cue_x, y, cue_w, h, color, Some(clip));
+        // Collapsed preview: muted "+N" suffix via small right-side hash marks.
+        if line.collapsed && line.hidden_line_count > 0 {
+            let mark_x = x_base + (width as i32).saturating_sub(cell_width as i32 * 4);
+            if mark_x > x_base {
+                fill_rect(
+                    out,
+                    width,
+                    height,
+                    mark_x,
+                    y + (h as i32 / 3),
+                    (cell_width as usize).saturating_mul(2).min(16),
+                    (h / 3).max(2),
+                    DISCLOSURE_COLLAPSED,
+                    Some(clip),
+                );
+            }
+        }
+    }
+}
+
 fn draw_segments(
     fonts: &FontStack,
     color_emoji: Option<&ColorEmojiAtlas>,
@@ -650,7 +669,6 @@ mod tests {
                 flat_index: 0,
                 col: 3,
             },
-            0,
             0.0,
             LEFT_PAD as i32,
             16.0,
@@ -668,7 +686,6 @@ mod tests {
                 flat_index: 0,
                 col: 9,
             },
-            0,
             0.0,
             LEFT_PAD as i32,
             16.0,
@@ -1930,5 +1947,58 @@ mod tests {
         assert!(out
             .iter()
             .any(|s| s.style.as_ref().is_some_and(|st| st.selected)));
+    }
+    #[test]
+    fn leading_combining_mark_at_segment_start_is_skipped() {
+        // Issue #327: a zero-width mark leading a segment at the row start
+        // has no previous cell; it must be skipped, not painted one cell
+        // left of the line base (into the left pad). The rendered output
+        // must be pixel-identical to the same line without the mark.
+        let mk = |text: &str, id: u64| FlatLine {
+            record_id: id,
+            line_index: 0,
+            segments: vec![TextSegment {
+                text: text.to_string(),
+                style: None,
+            }],
+            raw: text.to_string(),
+            level: None,
+            collapsible: false,
+            collapsed: false,
+            hidden_line_count: 0,
+        };
+        let with_mark = mk("\u{0301}b", 1);
+        let bare = mk("b", 2);
+        let width = 120u32;
+        let height = 40u32;
+        let mut buf_with = vec![0u8; (width * height * 4) as usize];
+        let mut buf_bare = vec![0u8; (width * height * 4) as usize];
+        let mut renderer = ViewportRenderer::new();
+        for (buf, line) in [(&mut buf_with, &with_mark), (&mut buf_bare, &bare)] {
+            renderer
+                .render(
+                    buf,
+                    width,
+                    height,
+                    &[line.clone()],
+                    0.0,
+                    0.0,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            buf_with, buf_bare,
+            "leading combining mark must be skipped: no ink left of the line base"
+        );
+        assert!(
+            char_column_lit(&buf_bare, width, 0, renderer.metrics.cell_width, 0.0),
+            "'b' must land in display cell 0"
+        );
     }
 }

@@ -174,22 +174,43 @@ impl SpawnResolver {
         let slots = self.slots.clone();
         let owned_command = command.to_string();
         let owned_cwd = cwd.to_string();
-        std::thread::spawn(move || {
-            // A panicking resolve must not poison the slot into a permanent
-            // "inflight" state — treat a panic like a failure.
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                resolve(&owned_command, args, &owned_cwd)
-            }))
-            .unwrap_or_else(|_| Err("spawn resolver panicked".to_string()));
-            let mut slots = slots.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(slot) = slots.get_mut(&key) {
-                // Successes and failures are both stored (failures so a parked
-                // spawn surfaces them); `request_fresh` retries stale failures.
-                slot.ready = Some(result);
-                slot.inflight = false;
-            }
-        });
+        let worker_key = key.clone();
+        let worker = std::thread::Builder::new()
+            .name("noviewlog-spawn-resolve".into())
+            .spawn(move || {
+                let key = worker_key;
+                // A panicking resolve must not poison the slot into a permanent
+                // "inflight" state — treat a panic like a failure.
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    resolve(&owned_command, args, &owned_cwd)
+                }))
+                .unwrap_or_else(|_| Err("spawn resolver panicked".to_string()));
+                let mut slots = slots.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(slot) = slots.get_mut(&key) {
+                    // Successes and failures are both stored (failures so a parked
+                    // spawn surfaces them); `request_fresh` retries stale failures.
+                    slot.ready = Some(result);
+                    slot.inflight = false;
+                }
+            });
+        // Thread exhaustion must degrade to a cached failure: an unchecked
+        // spawn result would wedge the slot — and the terminal's pending
+        // spawn — in "inflight" forever (#324; same contract as the
+        // file-load worker in file_load.rs).
+        if let Err(err) = worker {
+            self.store_worker_error(&key, format!("spawn resolver worker: {err}"));
+        }
         None
+    }
+
+    /// Cache a worker that never ran (thread spawn failure): the parked
+    /// spawn must learn about the failure, and `request_fresh` may retry.
+    fn store_worker_error(&self, key: &SpawnResolveKey, message: String) {
+        let mut slots = self.lock_slots();
+        if let Some(slot) = slots.get_mut(key) {
+            slot.ready = Some(Err(message));
+            slot.inflight = false;
+        }
     }
 
     /// Test hook: whether a ready result is cached for this key.
@@ -370,5 +391,31 @@ mod tests {
             .request_fresh("node", vec![], r"C:\p")
             .expect("cached success");
         assert!(again.is_ok());
+    }
+}
+
+#[cfg(test)]
+mod worker_failure_tests {
+    use super::*;
+
+    #[test]
+    fn worker_spawn_failure_does_not_wedge_slot() {
+        // Issue #324: if the worker thread never runs (thread::spawn
+        // failure), the next request must surface a cached error instead of
+        // returning None forever and parking the terminal's pending spawn.
+        let resolver =
+            SpawnResolver::with_resolve_fn(Arc::new(|_, _, _| Err("resolver unused".to_string())));
+        // Cold miss: the request kicks a worker (here: fails to spawn) and
+        // returns None.
+        assert!(resolver.request("cmd", vec![], "cwd").is_none());
+        let key = SpawnResolveKey::new("cmd", &[], "cwd");
+        resolver.store_worker_error(&key, "spawn resolver worker: simulated".to_string());
+        match resolver.request("cmd", vec![], "cwd") {
+            Some(Err(err)) => assert!(err.contains("simulated"), "{err}"),
+            other => panic!("slot wedged in inflight forever, got {other:?}"),
+        }
+        // A fresh retry kicks a new worker instead of resurfacing the stale
+        // error (the failure-cache contract).
+        assert!(resolver.request_fresh("cmd", vec![], "cwd").is_none());
     }
 }

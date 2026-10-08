@@ -44,10 +44,10 @@ impl Engine {
             return;
         }
         self.projects_dirty = true;
-        self.persist_changed_at = Some(Instant::now());
+        self.projects_persist_changed_at = Some(Instant::now());
         // Fresh dirty mark re-arms the normal debounce (issue #253): the
         // failure backoff applies only to retries of the same change.
-        self.persist_retry_delay = PERSIST_DEBOUNCE;
+        self.projects_persist_retry_delay = PERSIST_DEBOUNCE;
     }
 
     /// Snapshot live TERMINALS then FILES into the active Project's Programs.
@@ -60,30 +60,29 @@ impl Engine {
             return;
         }
 
-        let mut programs: Vec<ProgramConfig> = Vec::new();
-        for term in self.terminals.iter().filter(|t| !t.is_file_session()) {
-            programs.push(program_from_terminal(term, &programs));
-        }
-        for term in self.terminals.iter().filter(|t| t.is_file_session()) {
-            programs.push(program_from_terminal(term, &programs));
-        }
-
-        // Keep program_id links in sync with newly assigned ids (live then files).
-        let mut i = 0usize;
-        for term in self.terminals.iter_mut().filter(|t| !t.is_file_session()) {
-            if let Some(p) = programs.get(i) {
-                term.program_id = Some(p.id.clone());
-            }
-            i += 1;
-        }
-        for term in self.terminals.iter_mut().filter(|t| t.is_file_session()) {
-            if let Some(p) = programs.get(i) {
-                term.program_id = Some(p.id.clone());
-            }
-            i += 1;
+        // Snapshot order is TERMINALS (live) then FILES. Relink walks the same
+        // ordered pairs so inserting/removing a terminal between the two passes
+        // cannot mis-assign `program_id`s.
+        let mut snapshot: Vec<(String, ProgramConfig)> = Vec::new();
+        let mut programs_so_far: Vec<ProgramConfig> = Vec::new();
+        for term in self
+            .terminals
+            .iter()
+            .filter(|t| !t.is_file_session())
+            .chain(self.terminals.iter().filter(|t| t.is_file_session()))
+        {
+            let program = program_from_terminal(term, &programs_so_far);
+            programs_so_far.push(program.clone());
+            snapshot.push((term.id.clone(), program));
         }
 
-        self.projects.projects[proj_idx].programs = programs;
+        for (term_id, program) in &snapshot {
+            if let Some(term) = self.terminals.iter_mut().find(|t| t.id == *term_id) {
+                term.program_id = Some(program.id.clone());
+            }
+        }
+
+        self.projects.projects[proj_idx].programs = programs_so_far;
         self.persist_projects_store();
     }
 
@@ -113,7 +112,6 @@ impl Engine {
         }
         self.terminals.clear();
 
-        let runtime = build_runtime_config(&self.config, Some(&self.preset_name));
         let format = self.current_format();
         let max_records = self.config.max_scrollback_lines;
         let programs = self.projects.projects[proj_idx].programs.clone();
@@ -128,16 +126,14 @@ impl Engine {
 
         let mut new_sessions: Vec<TerminalState> = Vec::new();
         if live_programs.is_empty() {
-            let id = next_terminal_id(&new_sessions);
-            let mut term =
-                TerminalState::new(id, LaunchConfig::default(), &runtime, &format, max_records);
+            let id = next_terminal_id();
+            let mut term = TerminalState::new(id, LaunchConfig::default(), &format, max_records);
             term.running = false;
             new_sessions.push(term);
         } else {
             for (i, program) in live_programs.iter().enumerate() {
                 let id = format!("terminal-{}-{i}", crate::core::types::unique_time_suffix());
-                let mut term =
-                    TerminalState::new(id, program.launch.clone(), &runtime, &format, max_records);
+                let mut term = TerminalState::new(id, program.launch.clone(), &format, max_records);
                 apply_program_to_terminal(&mut term, program);
                 new_sessions.push(term);
             }
@@ -148,8 +144,7 @@ impl Engine {
                 "terminal-file-{}-{i}",
                 crate::core::types::unique_time_suffix()
             );
-            let mut term =
-                TerminalState::new(id, program.launch.clone(), &runtime, &format, max_records);
+            let mut term = TerminalState::new(id, program.launch.clone(), &format, max_records);
             apply_program_to_terminal(&mut term, program);
             configure_restored_file_session(&mut term);
             new_sessions.push(term);
@@ -195,6 +190,10 @@ impl Engine {
         if file_ids.is_empty() {
             return;
         }
+        // `start_log_file_load` writes through `active_terminal_mut()`, so each
+        // file must be switched in briefly (same trick as `advance_file_load`).
+        // Side effects of `terminal_switch` (dirty marks / stats / lazy probe)
+        // are load-bearing here — restore the previous active slot afterwards.
         let resume_id = self
             .terminals
             .get(self.active_terminal)

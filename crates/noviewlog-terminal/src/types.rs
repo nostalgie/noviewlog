@@ -107,7 +107,6 @@ pub struct FilterRule {
 #[derive(Clone, Debug)]
 pub struct LogFormat {
     pub id: String,
-    pub name: String,
     pub start: String,
     pub continuation: Vec<String>,
     pub start_regex: Option<Arc<Regex>>,
@@ -348,7 +347,9 @@ pub struct TextStyle {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SearchMatch {
     pub line_index: usize,
+    /// Inclusive start byte offset into [`FlatLine::raw`].
     pub start: usize,
+    /// Exclusive end byte offset into [`FlatLine::raw`].
     pub end: usize,
 }
 

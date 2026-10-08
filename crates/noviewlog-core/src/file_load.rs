@@ -71,58 +71,79 @@ fn transcode_utf16_to_temp(file: &mut File, big_endian: bool) -> Result<(PathBuf
     file.seek(SeekFrom::Start(2))
         .map_err(|e| format!("Seek failed: {e}"))?;
     let mut reader = BufReader::new(&mut *file);
-    let mut out = std::io::BufWriter::new(
-        std::fs::File::create(&out_path).map_err(|e| format!("Temp file create failed: {e}"))?,
-    );
+    let size = transcode_utf16_body(&mut reader, big_endian, &out_path)?;
+    Ok((out_path, size))
+}
 
-    // Stage keeps chunk boundaries pair-aligned; a trailing high surrogate is
-    // held back so pairs split across reads still decode.
-    let mut stage: Vec<u8> = Vec::with_capacity(65_536 + 1);
-    let mut chunk = vec![0u8; 65_536];
-    loop {
-        let n = reader
-            .read(&mut chunk)
-            .map_err(|e| format!("Read error: {e}"))?;
-        if n == 0 {
-            break;
-        }
-        stage.extend_from_slice(&chunk[..n]);
-        let usable = stage.len() & !1;
-        if usable == 0 {
-            continue;
-        }
-        let mut units = Vec::with_capacity(usable / 2);
-        for pair in stage[..usable].as_chunks::<2>().0 {
-            units.push(if big_endian {
-                u16::from_be_bytes([pair[0], pair[1]])
-            } else {
-                u16::from_le_bytes([pair[0], pair[1]])
-            });
-        }
-        let mut take = units.len();
-        if let Some(&last) = units.last() {
-            if (0xD800..0xDC00).contains(&last) {
-                take -= 1; // maybe a pair continues in the next chunk
+/// The transcode itself. Owns the output file, so ANY failure — read, write,
+/// flush — removes the temp file instead of leaving an orphan: the caller's
+/// [`TempFileGuard`] only takes over on success (issue #323).
+fn transcode_utf16_body(
+    reader: &mut dyn std::io::Read,
+    big_endian: bool,
+    out_path: &std::path::Path,
+) -> Result<u64, String> {
+    let mut out = std::io::BufWriter::new(
+        std::fs::File::create(out_path).map_err(|e| format!("Temp file create failed: {e}"))?,
+    );
+    let result = (|| -> Result<(), String> {
+        // Stage keeps chunk boundaries pair-aligned; a trailing high surrogate is
+        // held back so pairs split across reads still decode. Capacity is
+        // `TRANSCODE_CHUNK_BYTES + 1` so an odd leftover UTF-16 byte from the
+        // previous read still fits beside a full next chunk.
+        const TRANSCODE_CHUNK_BYTES: usize = 64 * 1024;
+        let mut stage: Vec<u8> = Vec::with_capacity(TRANSCODE_CHUNK_BYTES + 1);
+        let mut chunk = vec![0u8; TRANSCODE_CHUNK_BYTES];
+        loop {
+            let n = reader
+                .read(&mut chunk)
+                .map_err(|e| format!("Read error: {e}"))?;
+            if n == 0 {
+                break;
             }
+            stage.extend_from_slice(&chunk[..n]);
+            let usable = stage.len() & !1;
+            if usable == 0 {
+                continue;
+            }
+            let mut units = Vec::with_capacity(usable / 2);
+            for pair in stage[..usable].as_chunks::<2>().0 {
+                units.push(if big_endian {
+                    u16::from_be_bytes([pair[0], pair[1]])
+                } else {
+                    u16::from_le_bytes([pair[0], pair[1]])
+                });
+            }
+            let mut take = units.len();
+            if let Some(&last) = units.last() {
+                if (0xD800..0xDC00).contains(&last) {
+                    take -= 1; // maybe a pair continues in the next chunk
+                }
+            }
+            let text = String::from_utf16_lossy(&units[..take]);
+            out.write_all(text.as_bytes())
+                .map_err(|e| format!("Temp file write failed: {e}"))?;
+            stage.drain(..take * 2);
         }
-        let text = String::from_utf16_lossy(&units[..take]);
-        out.write_all(text.as_bytes())
+        if !stage.is_empty() {
+            // Dangling byte or unpaired surrogate at EOF.
+            out.write_all("\u{FFFD}".as_bytes())
+                .map_err(|e| format!("Temp file write failed: {e}"))?;
+        }
+        out.flush()
             .map_err(|e| format!("Temp file write failed: {e}"))?;
-        stage.drain(..take * 2);
+        Ok(())
+    })();
+    if let Err(e) = result {
+        drop(out);
+        let _ = std::fs::remove_file(out_path);
+        return Err(e);
     }
-    if !stage.is_empty() {
-        // Dangling byte or unpaired surrogate at EOF.
-        out.write_all("\u{FFFD}".as_bytes())
-            .map_err(|e| format!("Temp file write failed: {e}"))?;
-    }
-    out.flush()
-        .map_err(|e| format!("Temp file write failed: {e}"))?;
     drop(out);
 
-    let size = std::fs::metadata(&out_path)
+    Ok(std::fs::metadata(out_path)
         .map_err(|e| format!("Temp file stat failed: {e}"))?
-        .len();
-    Ok((out_path, size))
+        .len())
 }
 
 pub struct FileLoadState {
@@ -1119,5 +1140,72 @@ mod tests {
         let (disconnected, events) = handle.probe();
         assert!(disconnected);
         assert!(events.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod transcode_cleanup_tests {
+    use super::*;
+
+    /// A reader that yields one good chunk, then fails (simulated I/O error
+    /// mid-transcode, e.g. the source file vanishing or disk trouble).
+    struct FailingReader {
+        first: Vec<u8>,
+        done: bool,
+    }
+    impl std::io::Read for FailingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.done {
+                self.done = true;
+                let n = self.first.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.first[..n]);
+                return Ok(n);
+            }
+            Err(std::io::Error::other("simulated mid-transcode failure"))
+        }
+    }
+
+    #[test]
+    fn transcode_failure_removes_temp_output() {
+        // Issue #323: a failure after the temp file exists must not leak it —
+        // the caller's TempFileGuard only takes over after success.
+        let out_path = std::env::temp_dir().join(format!(
+            "noviewlog-323-{}-{}.log",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_file(&out_path);
+
+        // "h\u{e9}llo" as UTF-16LE + BOM bytes, so one good chunk lands
+        // before the read fails.
+        let mut first = vec![0xFF, 0xFE];
+        first.extend("h\u{e9}llo".encode_utf16().flat_map(u16::to_le_bytes));
+        let mut reader = FailingReader { first, done: false };
+
+        let err = transcode_utf16_body(&mut reader, false, &out_path).unwrap_err();
+        assert!(err.contains("simulated"), "{err}");
+        assert!(
+            !out_path.exists(),
+            "temp output must be removed on mid-transcode failure"
+        );
+    }
+
+    #[test]
+    fn transcode_success_keeps_temp_output() {
+        let out_path = std::env::temp_dir().join(format!(
+            "noviewlog-323-{}-{}.log",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_file(&out_path);
+
+        let mut bytes = vec![0xFF, 0xFE];
+        bytes.extend("ok".encode_utf16().flat_map(u16::to_le_bytes));
+        let mut reader = std::io::Cursor::new(bytes);
+
+        let size = transcode_utf16_body(&mut reader, false, &out_path).expect("transcode ok");
+        assert!(out_path.exists());
+        assert_eq!(size, std::fs::metadata(&out_path).unwrap().len());
+        let _ = std::fs::remove_file(&out_path);
     }
 }

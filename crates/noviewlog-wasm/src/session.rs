@@ -64,6 +64,48 @@ pub(crate) fn level_name(level: Option<LogLevel>) -> Option<&'static str> {
     }
 }
 
+/// Incremental search scan bookkeeping. Every "matches may be stale"
+/// transition goes through a named method so the flags stay consistent.
+#[derive(Debug)]
+struct SearchScanState {
+    /// Flat-line count already scanned for matches.
+    scan_end: usize,
+    /// The next scan must rebuild all matches instead of appending.
+    full_rescan: bool,
+    /// A scan is due on the next refresh.
+    dirty: bool,
+    /// Land on the last match once the next scan finishes.
+    jump_to_last: bool,
+    /// Scroll the renderer to the active match once one exists.
+    scroll_pending: bool,
+}
+
+impl Default for SearchScanState {
+    fn default() -> Self {
+        Self {
+            scan_end: 0,
+            full_rescan: true,
+            dirty: true,
+            jump_to_last: false,
+            scroll_pending: false,
+        }
+    }
+}
+
+impl SearchScanState {
+    /// Previously scanned offsets are meaningless: rescan from scratch.
+    fn invalidate_offsets(&mut self) {
+        self.full_rescan = true;
+        self.scan_end = 0;
+    }
+
+    /// Offsets are invalid and a scan is due on the next refresh.
+    fn invalidate_full(&mut self) {
+        self.dirty = true;
+        self.invalidate_offsets();
+    }
+}
+
 /// Per-session Tab/View: filters, severity, collapse set, search, flat lines.
 ///
 /// A simplified `noviewlog-core::LogView`: no viewport wrap index (the
@@ -85,11 +127,7 @@ pub struct SessionView {
     search_pattern: Option<SearchPattern>,
     search_matches: Vec<SearchMatch>,
     search_match_index: usize,
-    search_scan_end: usize,
-    search_full_rescan: bool,
-    search_dirty: bool,
-    search_jump_to_last: bool,
-    search_scroll_pending: bool,
+    search_scan: SearchScanState,
     /// Bumped when the view asks the renderer to scroll (search navigation).
     pub scroll_request: u32,
     pub flat_lines: Vec<FlatLine>,
@@ -133,11 +171,7 @@ impl SessionView {
             search_pattern: None,
             search_matches: Vec::new(),
             search_match_index: 0,
-            search_scan_end: 0,
-            search_full_rescan: true,
-            search_dirty: true,
-            search_jump_to_last: false,
-            search_scroll_pending: false,
+            search_scan: SearchScanState::default(),
             scroll_request: 0,
             flat_lines: Vec::new(),
             flat_lines_dirty: true,
@@ -241,11 +275,9 @@ impl SessionView {
     /// Desktop `mark_search_changed`: a new search jumps to the last match
     /// and scrolls there once matches are scanned.
     pub fn mark_search_changed(&mut self) {
-        self.search_jump_to_last = true;
-        self.search_dirty = true;
-        self.search_scroll_pending = true;
-        self.search_full_rescan = true;
-        self.search_scan_end = 0;
+        self.search_scan.jump_to_last = true;
+        self.search_scan.scroll_pending = true;
+        self.search_scan.invalidate_full();
         self.search_pattern = None;
     }
 
@@ -260,10 +292,10 @@ impl SessionView {
         let next = (current + delta).rem_euclid(len);
         self.search_match_index = next as usize;
         if self.search_active_line().is_some() {
-            self.search_scroll_pending = false;
+            self.search_scan.scroll_pending = false;
             self.scroll_request += 1;
         } else {
-            self.search_scroll_pending = true;
+            self.search_scan.scroll_pending = true;
         }
     }
 
@@ -305,9 +337,7 @@ impl SessionView {
             self.flat_lines_dirty = false;
             self.overlay_len = 0;
             self.last_dropped = dropped;
-            self.search_dirty = true;
-            self.search_full_rescan = true;
-            self.search_scan_end = 0;
+            self.search_scan.invalidate_full();
         } else if self.flat_lines_record_cursor < buffer.records_len() {
             let cursor = self.flat_lines_record_cursor;
             let appended = rebuild_flat_lines_for_records(
@@ -321,19 +351,18 @@ impl SessionView {
                 // Committed lines belong BEFORE the live overlay tail.
                 let split = self.flat_lines.len() - self.overlay_len;
                 self.flat_lines.splice(split..split, appended);
-                self.search_dirty = true;
+                self.search_scan.dirty = true;
                 if self.overlay_len > 0 {
                     // The splice shifts the overlay range and may overwrite
                     // previously scanned overlay content; incremental scan
                     // offsets cannot describe that, so rescan in full.
-                    self.search_full_rescan = true;
-                    self.search_scan_end = 0;
+                    self.search_scan.invalidate_offsets();
                 }
             }
         }
         self.replace_overlay(overlay);
-        if self.search_dirty {
-            self.search_dirty = false;
+        if self.search_scan.dirty {
+            self.search_scan.dirty = false;
             self.refresh_search_with_buffer(buffer);
         }
     }
@@ -355,11 +384,10 @@ impl SessionView {
             // Overlay content mutates in place (progress lines, rewrites), so
             // previously scanned matches may be stale; while a search is
             // active, only a full rescan gives correct results.
-            if self.search_scan_end > self.flat_lines.len() || !self.search_query.is_empty() {
-                self.search_full_rescan = true;
-                self.search_scan_end = 0;
+            if self.search_scan.scan_end > self.flat_lines.len() || !self.search_query.is_empty() {
+                self.search_scan.invalidate_offsets();
             }
-            self.search_dirty = true;
+            self.search_scan.dirty = true;
         }
         if filtered.is_empty() {
             return;
@@ -367,7 +395,7 @@ impl SessionView {
         self.overlay_len = filtered.len();
         self.flat_lines.extend(filtered);
         if !self.search_query.is_empty() {
-            self.search_dirty = true;
+            self.search_scan.dirty = true;
         }
     }
 
@@ -391,8 +419,7 @@ impl SessionView {
                 self.search_matches.clear();
                 self.search_pattern = None;
                 self.search_match_index = 0;
-                self.search_scan_end = 0;
-                self.search_full_rescan = true;
+                self.search_scan.invalidate_offsets();
                 None
             }
         }
@@ -404,10 +431,9 @@ impl SessionView {
             self.search_pattern = None;
             self.search_error = None;
             self.search_match_index = 0;
-            self.search_scan_end = 0;
-            self.search_full_rescan = true;
-            self.search_scroll_pending = false;
-            self.search_jump_to_last = false;
+            self.search_scan.invalidate_offsets();
+            self.search_scan.scroll_pending = false;
+            self.search_scan.jump_to_last = false;
             return;
         }
 
@@ -434,8 +460,7 @@ impl SessionView {
                 self.flat_lines_record_cursor = buffer.records_len();
                 self.overlay_len = 0;
                 self.last_dropped = buffer.dropped_count();
-                self.search_full_rescan = true;
-                self.search_scan_end = 0;
+                self.search_scan.invalidate_offsets();
             }
         }
         self.refresh_search();
@@ -446,36 +471,36 @@ impl SessionView {
             return;
         };
 
-        if self.search_full_rescan {
+        if self.search_scan.full_rescan {
             self.search_matches = collect_search_matches(&self.flat_lines, &pattern);
-            self.search_scan_end = self.flat_lines.len();
-            self.search_full_rescan = false;
-            if self.search_jump_to_last {
-                self.search_jump_to_last = false;
+            self.search_scan.scan_end = self.flat_lines.len();
+            self.search_scan.full_rescan = false;
+            if self.search_scan.jump_to_last {
+                self.search_scan.jump_to_last = false;
                 self.search_match_index = self.search_matches.len().saturating_sub(1);
             } else if self.search_match_index >= self.search_matches.len() {
                 self.search_match_index = self.search_matches.len().saturating_sub(1);
             }
-        } else if self.search_scan_end < self.flat_lines.len() {
-            let offset = self.search_scan_end;
+        } else if self.search_scan.scan_end < self.flat_lines.len() {
+            let offset = self.search_scan.scan_end;
             append_search_matches(
                 &mut self.search_matches,
                 &self.flat_lines[offset..],
                 offset,
                 &pattern,
             );
-            self.search_scan_end = self.flat_lines.len();
-            if self.search_jump_to_last {
-                self.search_jump_to_last = false;
+            self.search_scan.scan_end = self.flat_lines.len();
+            if self.search_scan.jump_to_last {
+                self.search_scan.jump_to_last = false;
                 self.search_match_index = self.search_matches.len().saturating_sub(1);
             }
-        } else if self.search_jump_to_last {
-            self.search_jump_to_last = false;
+        } else if self.search_scan.jump_to_last {
+            self.search_scan.jump_to_last = false;
             self.search_match_index = self.search_matches.len().saturating_sub(1);
         }
 
-        if self.search_scroll_pending {
-            self.search_scroll_pending = false;
+        if self.search_scan.scroll_pending {
+            self.search_scan.scroll_pending = false;
             if self.search_active_line().is_some() {
                 self.scroll_request += 1;
             }

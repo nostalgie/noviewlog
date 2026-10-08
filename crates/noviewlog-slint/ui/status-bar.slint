@@ -1,0 +1,79 @@
+// Bottom status row: engine status text, match-cap hint, live line counter.
+
+import { Theme } from "theme.slint";
+
+// Root is a TouchArea so a press on the strip can end inline rename (click-away).
+export component StatusBar inherits TouchArea {
+    in property <string> status-text: "";
+    // FILES filter scan hit the match-offset cap: persistent truncation hint (issue #150).
+    in property <bool> matches-capped: false;
+    // Live "current / total" line counter (right side).
+    in property <string> line-position-text: "";
+    // Pointer-down anywhere on the strip (host dismisses inline rename).
+    callback pressed-down();
+
+    height: 22px;
+    vertical-stretch: 0;
+    mouse-cursor: default;
+    pointer-event(event) => {
+        if (event.kind == PointerEventKind.down) {
+            root.pressed-down();
+        }
+    }
+
+    Rectangle {
+        height: 22px;
+        width: 100%;
+        background: Theme.bg-bar;
+
+        HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 8px;
+            spacing: 12px;
+
+            Text {
+                text: root.status-text;
+                color: Theme.text-secondary;
+                font-size: 11px;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+
+            // Match-set truncation hint (issue #150): Theme disc
+            // marker — never a Unicode icon — plus plain text.
+            if root.matches-capped: HorizontalLayout {
+                horizontal-stretch: 0;
+                spacing: 6px;
+
+                VerticalLayout {
+                    horizontal-stretch: 0;
+                    alignment: center;
+
+                    Rectangle {
+                        width: 7px;
+                        height: 7px;
+                        border-radius: 3.5px;
+                        background: Theme.exclude;
+                    }
+                }
+
+                Text {
+                    text: "matches capped";
+                    color: Theme.text-secondary;
+                    font-size: 11px;
+                    vertical-alignment: center;
+                }
+            }
+
+            if root.line-position-text != "": Text {
+                text: root.line-position-text;
+                color: Theme.text-muted;
+                font-size: 11px;
+                vertical-alignment: center;
+                horizontal-alignment: right;
+                horizontal-stretch: 0;
+            }
+        }
+    }
+}

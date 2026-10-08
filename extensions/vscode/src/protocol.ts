@@ -239,6 +239,24 @@ export interface CommandSavePanelWidth {
   width: number;
 }
 
+/**
+ * Max `CommandInput.data` length accepted by the host (and used by the
+ * webview to chunk long pastes). Named so the two sides cannot drift.
+ */
+export const MAX_INPUT_CHARS = 4096;
+
+/** Split `data` into host-safe chunks of at most `max` characters. */
+export function chunkInputData(data: string, max: number = MAX_INPUT_CHARS): string[] {
+  if (data.length === 0) {
+    return [];
+  }
+  const chunks: string[] = [];
+  for (let i = 0; i < data.length; i += max) {
+    chunks.push(data.slice(i, i + max));
+  }
+  return chunks;
+}
+
 /** Raw keystrokes for the PTY (terminal tab focused only). */
 export interface CommandInput {
   type: "input";

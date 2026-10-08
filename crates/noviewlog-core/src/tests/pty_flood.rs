@@ -7,10 +7,7 @@ fn poll_pty_budgets_bytes_and_holds_remainder() {
     let mut engine = Engine::new();
     let id = engine.active_terminal().id.clone();
     // Ensure live VT screen exists so feed updates buffer.
-    {
-        let term = engine.active_terminal_mut();
-        term.ingest.ensure_live_screen(&mut term.buffer);
-    }
+    engine.ensure_live_screen_for_test();
 
     let chunk = vec![b'a'; 4096];
     let over = (PTY_INGEST_BYTES_PER_TICK / chunk.len()) + 8;
@@ -36,10 +33,7 @@ fn poll_pty_budgets_bytes_and_holds_remainder() {
 fn poll_pty_sets_drain_pending_without_requiring_mid_tick_wake() {
     let mut engine = Engine::new();
     let id = engine.active_terminal().id.clone();
-    {
-        let term = engine.active_terminal_mut();
-        term.ingest.ensure_live_screen(&mut term.buffer);
-    }
+    engine.ensure_live_screen_for_test();
     let chunk = vec![b'a'; 4096];
     let over = (PTY_INGEST_BYTES_PER_TICK / chunk.len()) + 8;
     for _ in 0..over {
@@ -72,10 +66,7 @@ fn poll_pty_widens_budget_in_drain_mode() {
     use crate::engine::PTY_INGEST_BYTES_PER_TICK;
     let mut engine = Engine::new();
     let id = engine.active_terminal().id.clone();
-    {
-        let term = engine.active_terminal_mut();
-        term.ingest.ensure_live_screen(&mut term.buffer);
-    }
+    engine.ensure_live_screen_for_test();
     // 64 KB chunks, each ending in a newline so every chunk commits one record.
     let chunk: Vec<u8> = {
         let mut c = vec![b'x'; 64 * 1024 - 1];
@@ -115,10 +106,7 @@ fn ring_trim_anchors_scroll_when_follow_off() {
             max_scrollback_lines: 1_000,
         })
         .expect("settings");
-    {
-        let term = engine.active_terminal_mut();
-        term.ingest.ensure_live_screen(&mut term.buffer);
-    }
+    engine.ensure_live_screen_for_test();
     let id = engine.active_terminal().id.clone();
 
     let mut blob = Vec::new();
@@ -209,6 +197,83 @@ fn ring_trim_anchors_scroll_when_follow_off() {
 }
 
 #[test]
+fn follow_snap_does_not_pin_filter_tab_scroll() {
+    // Issue #316: the Terminal tab (view 0) keeps Follow while the user reads
+    // a filter tab whose Follow is cleared — ingest must not move the shared
+    // scroll_offset_y out from under the active filter tab.
+    let mut engine = Engine::new();
+    engine
+        .send_command(Command::SetSettings {
+            max_scrollback_lines: 5_000,
+        })
+        .expect("settings");
+    engine.ensure_live_screen_for_test();
+    let id = engine.active_terminal().id.clone();
+
+    let mut blob = Vec::new();
+    for i in 0..600 {
+        blob.extend_from_slice(format!("LINE-{i:04} {}\r\n", "x".repeat(40)).as_bytes());
+    }
+    for chunk in blob.chunks(4096) {
+        engine
+            .pty_tx
+            .try_send(PtyEvent::Bytes {
+                id: id.clone(),
+                data: chunk.to_vec(),
+                generation: 0,
+            })
+            .ok();
+        engine.poll_pty();
+        engine.tick();
+    }
+
+    engine
+        .send_command(Command::TabAdd)
+        .expect("add filter tab");
+    assert_eq!(engine.active_terminal().active_view, 1);
+    // Clear Follow on the filter tab only; view 0 keeps Follow — that is the bug trigger.
+    engine
+        .send_command(Command::SetFollow { follow: false })
+        .expect("follow off on filter tab");
+    assert!(!engine.active_terminal().active_view().auto_follow);
+    assert!(engine.active_terminal().views[0].auto_follow);
+
+    let max = engine.max_scroll_offset_for_test();
+    engine
+        .send_command(Command::Scroll { offset: max * 0.5 })
+        .expect("scroll filter tab");
+    engine.tick();
+    let scroll_before = engine.scroll_offset_y_for_test();
+    assert!(
+        scroll_before > 1.0,
+        "precondition: scrolled up ({scroll_before})"
+    );
+
+    let more = format!("NEWER {}\r\n", "y".repeat(40))
+        .into_bytes()
+        .repeat(120);
+    for chunk in more.chunks(4096) {
+        engine
+            .pty_tx
+            .try_send(PtyEvent::Bytes {
+                id: id.clone(),
+                data: chunk.to_vec(),
+                generation: 0,
+            })
+            .ok();
+        engine.poll_pty();
+        engine.tick();
+    }
+
+    let scroll_after = engine.scroll_offset_y_for_test();
+    assert!(
+        (scroll_after - scroll_before).abs() < 1.0,
+        "ingest must not pin the shared scroll while a filter tab is active \
+         (before={scroll_before} after={scroll_after})"
+    );
+}
+
+#[test]
 #[ignore = "slow tier: real shell + 12 MiB fixture, latency-sensitive; run with -- --ignored"]
 fn cat_big_log_poll_ticks_stay_bounded() {
     // Issue #72: generated fixture instead of a hardcoded dev-machine path.
@@ -289,7 +354,6 @@ fn flood_paint_dirty_is_cadenced_and_follow_stays_snapped() {
     {
         let term = engine.active_terminal_mut();
         term.running = true;
-        term.ingest.ensure_live_screen(&mut term.buffer);
     }
     let id = engine.active_terminal().id.clone();
     let chunk = vec![b'x'; 4096];
@@ -373,10 +437,7 @@ fn follow_scroll_does_not_jump_across_tick_rebuild() {
     engine
         .send_command(Command::SetFollow { follow: true })
         .expect("follow");
-    {
-        let term = engine.active_terminal_mut();
-        term.ingest.ensure_live_screen(&mut term.buffer);
-    }
+    engine.ensure_live_screen_for_test();
     engine.tick();
     let id = engine.active_terminal().id.clone();
     engine.active_terminal_mut().running = true;
@@ -419,7 +480,6 @@ fn follow_flood_does_not_patch_overlay_into_logview() {
     {
         let term = engine.active_terminal_mut();
         term.running = true;
-        term.ingest.ensure_live_screen(&mut term.buffer);
     }
     let before_lines = engine.active_view().flat_lines.len();
     let before_overlay = engine.active_view().overlay_len();
@@ -509,7 +569,6 @@ fn follow_wrap_live_grid_render_does_not_panic() {
     {
         let term = engine.active_terminal_mut();
         term.running = true;
-        term.ingest.ensure_live_screen(&mut term.buffer);
         let long = format!("{}\r\n", "https://example.com/path/").repeat(30);
         term.ingest
             .feed(long.as_bytes(), &mut term.buffer, &mut term.parser);
@@ -535,7 +594,6 @@ fn follow_live_line_counter_grows_past_scrollback_cap() {
     {
         let term = engine.active_terminal_mut();
         term.running = true;
-        term.ingest.ensure_live_screen(&mut term.buffer);
         let mut blob = String::new();
         for i in 0..800 {
             blob.push_str(&format!("line-{i}\n"));

@@ -8,13 +8,14 @@ use noviewlog_core::Command;
 use slint::{ComponentHandle, Timer, TimerMode};
 
 use crate::ctx::Ctx;
+use noviewlog_slint::stats_sync::FindQuery;
 use noviewlog_slint::ui::AppWindow;
 
 /// Debounce for find `search_set` (search bar cadence).
 const FIND_DEBOUNCE: Duration = Duration::from_millis(150);
 
-/// Pending find input captured while typing: (query, regex, case_sensitive, whole_word).
-pub(crate) type FindPending = Rc<RefCell<Option<(String, bool, bool, bool)>>>;
+/// Pending find input captured while typing.
+pub(crate) type FindPending = Rc<RefCell<Option<FindQuery>>>;
 
 pub(crate) fn install(
     ui: &AppWindow,
@@ -36,18 +37,23 @@ fn install_query_changed(
 ) {
     let ctx = ctx.clone();
     ui.on_find_query_changed(move |query, regex, case_sensitive, whole_word| {
-        *find_pending.borrow_mut() = Some((query.to_string(), regex, case_sensitive, whole_word));
+        *find_pending.borrow_mut() = Some(FindQuery {
+            text: query.to_string(),
+            regex,
+            case_sensitive,
+            whole_word,
+        });
         let ctx = ctx.clone();
         let find_pending = find_pending.clone();
         find_debounce.start(TimerMode::SingleShot, FIND_DEBOUNCE, move || {
-            let Some((q, re, cs, ww)) = find_pending.borrow_mut().take() else {
+            let Some(q) = find_pending.borrow_mut().take() else {
                 return;
             };
             let _ = ctx.send(Command::SearchSet {
-                query: q,
-                regex: re,
-                case_sensitive: cs,
-                whole_word: ww,
+                query: q.text,
+                regex: q.regex,
+                case_sensitive: q.case_sensitive,
+                whole_word: q.whole_word,
             });
             ctx.refresh();
         });
@@ -59,12 +65,12 @@ fn install_goto(ui: &AppWindow, ctx: &Ctx, find_debounce: Rc<Timer>, find_pendin
     ui.on_find_goto(move |delta| {
         // Flush pending search_set before navigating.
         find_debounce.stop();
-        if let Some((q, re, cs, ww)) = find_pending.borrow_mut().take() {
+        if let Some(q) = find_pending.borrow_mut().take() {
             let _ = ctx.send(Command::SearchSet {
-                query: q,
-                regex: re,
-                case_sensitive: cs,
-                whole_word: ww,
+                query: q.text,
+                regex: q.regex,
+                case_sensitive: q.case_sensitive,
+                whole_word: q.whole_word,
             });
         }
         ctx.send_refresh(Command::SearchGoto { delta });
@@ -75,14 +81,14 @@ fn install_commit(ui: &AppWindow, ctx: &Ctx, find_debounce: Rc<Timer>, find_pend
     let ctx = ctx.clone();
     ui.on_find_commit(move || {
         find_debounce.stop();
-        let Some((q, re, cs, ww)) = find_pending.borrow_mut().take() else {
+        let Some(q) = find_pending.borrow_mut().take() else {
             return;
         };
         let _ = ctx.send(Command::SearchSet {
-            query: q,
-            regex: re,
-            case_sensitive: cs,
-            whole_word: ww,
+            query: q.text,
+            regex: q.regex,
+            case_sensitive: q.case_sensitive,
+            whole_word: q.whole_word,
         });
         ctx.refresh();
     });

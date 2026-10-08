@@ -213,11 +213,16 @@ fn composite(dst: &mut Canvas, src: &Canvas, mode: CompositeMode) {
     }
 }
 
-/// W3C blend with premultiplied inputs: result keeps source-over alpha.
+/// Source-over alpha with premultiplied RGB. The divide-then-multiply by `a`
+/// cancels whenever `a > 0`, so this is the identity `(r, g, b, a)` plus float
+/// noise — a Segoe approximation that deliberately omits W3C cross terms.
 fn blend(sa: f32, da: f32, r: f32, g: f32, b: f32) -> (f32, f32, f32, f32) {
     let a = sa + da * (1.0 - sa);
-    let k = if a > 0.0 { 1.0 / a } else { 0.0 };
-    (r * k * a, g * k * a, b * k * a, a)
+    if a > 0.0 {
+        (r, g, b, a)
+    } else {
+        (0.0, 0.0, 0.0, 0.0)
+    }
 }
 
 /// A flattened outline in pixel space.
@@ -1254,8 +1259,16 @@ mod tests {
             eprintln!("skip: Segoe UI Emoji not available");
             return;
         };
-        let has_red = v0.chunks_exact(4).any(|px| px[0] > 0.0 && px[3] > 0.0);
-        let has_green = v1.chunks_exact(4).any(|px| px[1] > 0.0 && px[3] > 0.0);
+        let has_red = v0
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|px| px[0] > 0.0 && px[3] > 0.0);
+        let has_green = v1
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .any(|px| px[1] > 0.0 && px[3] > 0.0);
         assert!(has_red, "pending-outline paint path must fill the glyph");
         assert!(has_green, "clip-as-fill-region paint path must paint");
     }
@@ -1311,7 +1324,9 @@ mod tests {
         };
         let painted_cols: Vec<i32> = canvas
             .px
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .enumerate()
             .filter(|(_, px)| px[3] > 0.0)
             .map(|(i, _)| (i % 32) as i32)

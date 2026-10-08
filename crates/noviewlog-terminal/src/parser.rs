@@ -166,7 +166,6 @@ mod tests {
         // continuation regex must not accumulate without bound.
         let format = LogFormat {
             id: "python-test".into(),
-            name: "python-test".into(),
             start: r"^\[start\]".into(),
             continuation: vec![r"^\s+".into()],
             start_regex: Some(Arc::new(regex::Regex::new(r"^\[start\]").unwrap())),

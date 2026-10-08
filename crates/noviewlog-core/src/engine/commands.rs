@@ -284,9 +284,8 @@ impl Engine {
                 regex,
             } => self.add_filter(filter_type, &pattern, regex),
             Command::FilterClear => {
-                if self.active_terminal().active_view == 0 {
-                    // The Terminal tab has no filters.
-                } else {
+                // The Terminal tab has no filters.
+                if self.active_terminal().active_view != 0 {
                     self.active_view_mut().clear_filters();
                     self.reset_file_match_viewport();
                     self.sync_active_project_from_terminals();
@@ -296,9 +295,8 @@ impl Engine {
             Command::FilterRemove { id } => self.filter_remove(&id),
             Command::FilterUpdate { id, pattern } => self.filter_update(&id, &pattern),
             Command::FilterSet { filters } => {
-                if self.active_terminal().active_view == 0 {
-                    // The Terminal tab has no filters.
-                } else {
+                // The Terminal tab has no filters.
+                if self.active_terminal().active_view != 0 {
                     let (compiled, notices): (Vec<_>, Vec<_>) =
                         filters.into_iter().map(compile_filter_checked).fold(
                             (Vec::new(), Vec::new()),
@@ -326,6 +324,7 @@ impl Engine {
                     } else {
                         self.scroll_file_to_global_offset(offset);
                     }
+                    self.last_stats_at = None;
                 } else {
                     self.scroll_to_offset(offset);
                 }
@@ -368,7 +367,10 @@ impl Engine {
                 self.sync_active_project_from_terminals();
             }
             Command::LoadPreset { name } => self.preset_apply(&name),
-            Command::SaveConfig => self.preset_create_from_tab(&self.preset_name.clone()),
+            Command::SaveConfig => {
+                let name = self.preset_name.clone();
+                self.preset_create_from_tab(&name);
+            }
             Command::PresetGet { name } => self.preset_get(&name),
             Command::PresetSave { name, filters } => self.preset_save(&name, filters),
             Command::PresetDelete { name } => self.preset_delete(&name),

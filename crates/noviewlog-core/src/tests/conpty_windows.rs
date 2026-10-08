@@ -43,7 +43,6 @@ fn spawn_interactive_cmd() -> Engine {
     engine
 }
 
-#[cfg(windows)]
 #[test]
 #[ignore = "real ConPTY; run with --ignored on a Windows host"]
 fn conpty_typed_line_echoes_resizes_and_exits() {
@@ -92,7 +91,6 @@ fn conpty_typed_line_echoes_resizes_and_exits() {
     );
 }
 
-#[cfg(windows)]
 #[test]
 #[ignore = "real ConPTY; run with --ignored on a Windows host"]
 fn conpty_kill_during_output_stops_cleanly() {

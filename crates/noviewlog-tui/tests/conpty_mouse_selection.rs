@@ -12,9 +12,7 @@
 //! screen grid. Reproduction + regression lock for the "selection end snaps
 //! to end of line" bug (user report 2026-09-26).
 //!
-//! Known pre-existing quirk (documented here, deliberately not fixed): the
-//! painted highlight end is exclusive while the copied text end is inclusive
-//! — one extra char is copied vs highlighted.
+//! Highlight and copy share an end-inclusive cell span (issue #350).
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
@@ -224,18 +222,18 @@ fn drag_select(tui: &mut Tui, row: usize, col: usize, k: usize) {
     tui.write(&mouse_up(r, c + k));
 }
 
-/// Cells `[col, col + k)` of `row` must carry the selection bg, every other
-/// cell of the row must not.
+/// Cells `[col, col + k]` of `row` must carry the selection bg (end-inclusive;
+/// drag release at `col + k`), every other cell of the row must not.
 fn assert_highlight_extent(grid: &[FlatLine], row: usize, col: usize, k: usize) {
     let line = &grid[row];
     let text = row_text(line);
     let bgs = cell_bgs(line);
     assert!(
-        bgs.len() >= col + k,
+        bgs.len() > col + k,
         "row {row} too short for the selection: {text:?}"
     );
     for (i, bg) in bgs.iter().enumerate() {
-        let want = if (col..col + k).contains(&i) {
+        let want = if (col..=col + k).contains(&i) {
             Some(SELECTION_BG)
         } else {
             None
@@ -338,7 +336,7 @@ fn release_copies_selected_text() {
     let k = len / 2;
     let (row, col) = (scene.row, scene.col);
     drag_select(&mut scene.tui, row, col, k);
-    // Copied text is end-inclusive (known quirk): k + 1 chars.
+    // Copied text is end-inclusive (matches highlight): k + 1 chars.
     let expected: String = scene.sentinel.chars().take(k + 1).collect();
     assert!(
         wait_clipboard(&scene.tui, &expected),
@@ -352,10 +350,10 @@ fn release_copies_selected_text() {
 fn click_without_drag_copies_nothing() {
     let mut scene = scene_with_echoed_sentinel();
     // The would-be product copy on a wrongful click: the release-point span
-    // prefix (end-inclusive quirk). Asserting "clipboard != this exact
-    // value" — not "clipboard == what we set" — keeps the test immune to
-    // external clipboard writers (the terminal itself syncs the shared
-    // system clipboard), which produced a one-off false failure (#268).
+    // prefix (end-inclusive). Asserting "clipboard != this exact value" —
+    // not "clipboard == what we set" — keeps the test immune to external
+    // clipboard writers (the terminal itself syncs the shared system
+    // clipboard), which produced a one-off false failure (#268).
     let len = scene.sentinel.chars().count();
     let wrong_copy: String = scene.sentinel.chars().take(len / 2 + 1).collect();
     let (row, col) = (scene.row, scene.col);

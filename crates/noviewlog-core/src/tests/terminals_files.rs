@@ -1,3 +1,99 @@
+use crate::engine::Engine;
+use std::fmt::Display;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+/// Temp log file (`noviewlog-{tag}-{pid}.log`, one line per item) removed on
+/// drop, including after a failed assertion. Derefs to its path.
+struct TempLog(PathBuf);
+
+impl std::ops::Deref for TempLog {
+    type Target = Path;
+
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for TempLog {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Write `lines` to a fresh temp log. `tag` must be unique per test: the PID
+/// suffix only separates test binaries, not parallel tests in one binary.
+fn temp_log_file(tag: &str, lines: impl IntoIterator<Item = impl Display>) -> TempLog {
+    let path = std::env::temp_dir().join(format!("noviewlog-{tag}-{}.log", std::process::id()));
+    let mut out = std::io::BufWriter::new(std::fs::File::create(&path).unwrap());
+    for line in lines {
+        writeln!(out, "{line}").unwrap();
+    }
+    out.flush().unwrap();
+    TempLog(path)
+}
+
+/// Send `load_file` for `path` and finish the async load.
+fn load_file_now(engine: &mut Engine, path: &Path) {
+    let path_str = path.to_string_lossy().replace('\\', "\\\\");
+    engine
+        .send_command_json(&format!(r#"{{"cmd":"load_file","path":"{path_str}"}}"#))
+        .expect("load_file");
+    engine.finish_file_load_for_test();
+}
+
+/// Drop queued events, force the 250 ms stats throttle due (issue #351:
+/// backdate the last emission instead of sleeping), tick, and return the
+/// newest `stats` event.
+fn drain_stats(engine: &mut Engine) -> serde_json::Value {
+    use std::time::{Duration, Instant};
+
+    while engine.poll_event_json().is_some() {}
+    engine.last_stats_at = Some(Instant::now() - Duration::from_millis(300));
+    engine.tick();
+    let mut stats = None;
+    while let Some(ev) = engine.poll_event_json() {
+        let v: serde_json::Value = serde_json::from_str(&ev).unwrap();
+        if v["type"] == "stats" {
+            stats = Some(v);
+        }
+    }
+    stats.expect("stats event")
+}
+
+/// Engine with `path` loaded and a filter tab scanning it for "10:00:00"; the
+/// scan worker is spawned so the view owns its cancel flag. Returns the
+/// engine plus a handle on that flag (it survives the view being dropped).
+fn engine_with_inflight_match_scan(path: &Path) -> (Engine, Arc<AtomicBool>) {
+    let mut engine = Engine::new();
+    engine
+        .send_command_json(r#"{"cmd":"resize","width":800,"height":400}"#)
+        .expect("resize");
+    load_file_now(&mut engine, path);
+    engine
+        .send_command_json(r#"{"cmd":"tab_add"}"#)
+        .expect("tab_add");
+    engine
+        .send_command_json(r#"{"cmd":"filter_add","type":"include","pattern":"10:00:00"}"#)
+        .expect("filter_add");
+    assert!(
+        engine.match_scan_pos_for_test().is_some(),
+        "scan must be in flight"
+    );
+    // Spawning the scan worker is what installs the cancel flag in the view.
+    engine.advance_file_match_scan();
+    let cancel = engine
+        .active_terminal()
+        .active_view()
+        .match_scan_cancel
+        .clone()
+        .expect("in-flight scan must own a cancel flag");
+    assert!(!cancel.load(Ordering::Relaxed));
+    (engine, cancel)
+}
+
 #[test]
 fn selection_copy_returns_plain_text() {
     use crate::engine::Engine;
@@ -239,26 +335,11 @@ fn idle_running_follow_does_not_need_render() {
 
 #[test]
 fn stats_json_includes_terminals() {
-    use crate::engine::Engine;
-    use serde_json::Value;
-    use std::thread;
-    use std::time::Duration;
-
     let mut engine = Engine::new();
     engine
         .send_command_json(r#"{"cmd":"terminal_add"}"#)
         .expect("add");
-    while engine.poll_event_json().is_some() {}
-    thread::sleep(Duration::from_millis(260));
-    engine.tick();
-    let mut stats = None;
-    while let Some(ev) = engine.poll_event_json() {
-        let v: Value = serde_json::from_str(&ev).unwrap();
-        if v["type"] == "stats" {
-            stats = Some(v);
-        }
-    }
-    let parsed = stats.expect("stats event");
+    let parsed = drain_stats(&mut engine);
     assert!(parsed["terminals"].as_array().unwrap().len() >= 2);
     assert!(parsed["active_terminal"].as_u64().is_some());
     assert!(parsed["terminal_id"].as_str().is_some());
@@ -267,53 +348,27 @@ fn stats_json_includes_terminals() {
 
 #[test]
 fn load_file_on_terminal_sets_log_file() {
-    use crate::engine::Engine;
-    use std::io::Write;
-
-    let path = std::env::temp_dir().join(format!("noviewlog-test-{}.log", std::process::id()));
-    {
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, "line one").unwrap();
-        writeln!(f, "line two").unwrap();
-    }
+    let path = temp_log_file("test", ["line one", "line two"]);
     let mut engine = Engine::new();
-    let path_str = path.to_string_lossy().replace('\\', "\\\\");
-    engine
-        .send_command_json(&format!(r#"{{"cmd":"load_file","path":"{path_str}"}}"#))
-        .expect("load_file");
-    engine.finish_file_load_for_test();
+    load_file_now(&mut engine, &path);
     assert!(engine.buffer_record_count_for_test() >= 2);
     // load_file always opens a dedicated file session (live terminal stays).
     assert_eq!(engine.terminals_for_test().len(), 2);
     assert!(engine.active_is_file_session_for_test());
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn load_file_creates_separate_terminal_when_session_used() {
-    use crate::engine::Engine;
-    use std::io::Write;
-
-    let path = std::env::temp_dir().join(format!("noviewlog-file-term-{}.log", std::process::id()));
-    {
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, "alpha").unwrap();
-        writeln!(f, "beta").unwrap();
-    }
+    let path = temp_log_file("file-term", ["alpha", "beta"]);
     let mut engine = Engine::new();
     // Simulate an interactive session that already started (must not be hijacked).
     engine.mark_active_process_started_for_test();
-    let path_str = path.to_string_lossy().replace('\\', "\\\\");
-    engine
-        .send_command_json(&format!(r#"{{"cmd":"load_file","path":"{path_str}"}}"#))
-        .expect("load_file");
-    engine.finish_file_load_for_test();
+    load_file_now(&mut engine, &path);
     assert_eq!(engine.terminals_for_test().len(), 2);
     assert_eq!(engine.active_terminal_index_for_test(), 1);
     assert!(engine.active_is_file_session_for_test());
     assert!(!engine.terminal_is_file_session_for_test(0));
     assert!(engine.buffer_record_count_for_test() >= 2);
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -357,20 +412,9 @@ fn load_file_reopen_switches_to_existing_file_terminal() {
 
 #[test]
 fn file_session_rejects_stdin_and_start() {
-    use crate::engine::Engine;
-    use std::io::Write;
-
-    let path = std::env::temp_dir().join(format!("noviewlog-viewonly-{}.log", std::process::id()));
-    {
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, "line").unwrap();
-    }
+    let path = temp_log_file("viewonly", ["line"]);
     let mut engine = Engine::new();
-    let path_str = path.to_string_lossy().replace('\\', "\\\\");
-    engine
-        .send_command_json(&format!(r#"{{"cmd":"load_file","path":"{path_str}"}}"#))
-        .expect("load_file");
-    engine.finish_file_load_for_test();
+    load_file_now(&mut engine, &path);
     assert!(engine.active_is_file_session_for_test());
 
     engine.handle_key(b"echo hi\n");
@@ -382,7 +426,6 @@ fn file_session_rejects_stdin_and_start() {
     assert!(engine.active_is_file_session_for_test());
     assert!(!engine.active_terminal_running_for_test());
     assert!(engine.status_message_for_test().contains("view-only"));
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -571,36 +614,11 @@ fn stale_pty_exit_does_not_replace_cli_process() {
 
 #[test]
 fn stats_split_terminals_and_files() {
-    use crate::engine::Engine;
-    use serde_json::Value;
-    use std::io::Write;
-    use std::thread;
-    use std::time::Duration;
-
-    let path =
-        std::env::temp_dir().join(format!("noviewlog-stats-split-{}.log", std::process::id()));
-    {
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, "hello").unwrap();
-    }
+    let path = temp_log_file("stats-split", ["hello"]);
     let mut engine = Engine::new();
-    let path_str = path.to_string_lossy().replace('\\', "\\\\");
-    engine
-        .send_command_json(&format!(r#"{{"cmd":"load_file","path":"{path_str}"}}"#))
-        .expect("load_file");
-    engine.finish_file_load_for_test();
+    load_file_now(&mut engine, &path);
 
-    while engine.poll_event_json().is_some() {}
-    thread::sleep(Duration::from_millis(260));
-    engine.tick();
-    let mut stats = None;
-    while let Some(ev) = engine.poll_event_json() {
-        let v: Value = serde_json::from_str(&ev).unwrap();
-        if v["type"] == "stats" {
-            stats = Some(v);
-        }
-    }
-    let parsed = stats.expect("stats");
+    let parsed = drain_stats(&mut engine);
     assert_eq!(parsed["terminals"].as_array().unwrap().len(), 1);
     assert_eq!(parsed["files"].as_array().unwrap().len(), 1);
     assert!(parsed["is_file_session"].as_bool().unwrap());
@@ -610,50 +628,25 @@ fn stats_split_terminals_and_files() {
         parsed["tabs"][0]["name"].as_str().unwrap(),
         file_name.as_ref()
     );
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn file_session_ignores_set_follow() {
-    use crate::engine::Engine;
-    use std::io::Write;
-
-    let path = std::env::temp_dir().join(format!("noviewlog-nofollow-{}.log", std::process::id()));
-    {
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, "line").unwrap();
-    }
+    let path = temp_log_file("nofollow", ["line"]);
     let mut engine = Engine::new();
-    let path_str = path.to_string_lossy().replace('\\', "\\\\");
-    engine
-        .send_command_json(&format!(r#"{{"cmd":"load_file","path":"{path_str}"}}"#))
-        .expect("load_file");
-    engine.finish_file_load_for_test();
+    load_file_now(&mut engine, &path);
     engine
         .send_command_json(r#"{"cmd":"set_follow","follow":true}"#)
         .expect("set_follow");
     assert!(!engine.auto_follow_for_test());
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn can_close_file_while_keeping_last_live() {
-    use crate::engine::Engine;
-    use std::io::Write;
-
-    let path =
-        std::env::temp_dir().join(format!("noviewlog-close-file-{}.log", std::process::id()));
-    {
-        let mut f = std::fs::File::create(&path).unwrap();
-        writeln!(f, "line").unwrap();
-    }
+    let path = temp_log_file("close-file", ["line"]);
     let mut engine = Engine::new();
     let live_id = engine.active_terminal_id_for_test();
-    let path_str = path.to_string_lossy().replace('\\', "\\\\");
-    engine
-        .send_command_json(&format!(r#"{{"cmd":"load_file","path":"{path_str}"}}"#))
-        .expect("load_file");
-    engine.finish_file_load_for_test();
+    load_file_now(&mut engine, &path);
     let file_id = engine.active_terminal_id_for_test();
     assert_ne!(live_id, file_id);
 
@@ -665,7 +658,6 @@ fn can_close_file_while_keeping_last_live() {
     assert_eq!(engine.terminals_for_test().len(), 1);
     assert_eq!(engine.active_terminal_id_for_test(), live_id);
     assert!(!engine.active_is_file_session_for_test());
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -744,6 +736,209 @@ fn file_scrollbar_mid_jump_loads_window_not_black() {
     assert!(
         cur > total / 4 && cur < total * 3 / 4,
         "mid scroll should report mid line position cur={cur} total={total}"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn file_open_eof_pending_does_not_fake_n_over_n() {
+    use crate::engine::Engine;
+    use std::io::Write;
+
+    let path = std::env::temp_dir().join(format!(
+        "noviewlog-open-pending-counter-{}.log",
+        std::process::id()
+    ));
+    {
+        let mut f = std::fs::File::create(&path).unwrap();
+        for i in 0..250_000 {
+            writeln!(f, "access-{i:06} GET /x HTTP/1.1 200").unwrap();
+        }
+    }
+    let mut engine = Engine::new();
+    engine
+        .send_command_json(r#"{"cmd":"resize","width":800,"height":400}"#)
+        .expect("resize");
+    let path_str = path.to_string_lossy().replace('\\', "\\\\");
+    engine
+        .send_command_json(&format!(r#"{{"cmd":"load_file","path":"{path_str}"}}"#))
+        .expect("load_file");
+    while engine.file_load_pending_for_test() {
+        engine.advance_file_load();
+    }
+    engine.rebuild_if_needed_for_test();
+    engine.maybe_apply_open_eof_scroll_for_test();
+
+    let total = engine.file_total_lines_for_test();
+    assert!(engine.pending_file_window_for_test());
+    let (cur, tot) = engine.viewport_line_position_for_test();
+    assert_eq!(tot, total);
+    assert!(
+        cur < tot,
+        "must not show N / N while the EOF window read is still in flight (cur={cur} tot={tot})"
+    );
+    assert!(
+        !engine.at_scroll_bottom(),
+        "thumb must not read at bottom before the EOF window lands"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn file_eof_scrollbar_y_matches_max_with_wrap_long_lines() {
+    use crate::engine::{Command, Engine};
+    use std::io::Write;
+
+    let path = std::env::temp_dir().join(format!(
+        "noviewlog-wrap-eof-scroll-{}.log",
+        std::process::id()
+    ));
+    let pad = "x".repeat(200);
+    {
+        let mut f = std::fs::File::create(&path).unwrap();
+        for i in 0..30_000 {
+            writeln!(f, "GET /css/hw-global-{i:05}-{pad} HTTP/1.1 200").unwrap();
+        }
+    }
+    let mut engine = Engine::new();
+    engine
+        .send_command_json(r#"{"cmd":"resize","width":800,"height":400}"#)
+        .expect("resize");
+    engine
+        .send_command_json(r#"{"cmd":"set_wrap_lines","wrap":true}"#)
+        .expect("wrap");
+    let path_str = path.to_string_lossy().replace('\\', "\\\\");
+    engine
+        .send_command_json(&format!(r#"{{"cmd":"load_file","path":"{path_str}"}}"#))
+        .expect("load_file");
+    engine.finish_file_load_for_test();
+    engine.finish_pending_file_window_for_test();
+    engine.rebuild_if_needed_for_test();
+
+    let max = engine.max_scroll_offset_for_test();
+    let global = engine.stats_scroll_y_for_test();
+    assert!(
+        max > 0.0,
+        "wrap + long lines must produce a non-zero scroll range"
+    );
+    assert!(
+        global + 2.0 >= max,
+        "stats scroll_y must reach max at EOF (global={global} max={max})"
+    );
+    let (cur, total) = engine.viewport_line_position_for_test();
+    assert_eq!(cur, total, "line counter must read N / N at true EOF");
+    assert!(
+        engine.at_scroll_bottom(),
+        "global scroll must be at bottom (global={global} max={max})"
+    );
+
+    // Mid-file scrollbar jump must not leave stats below max (thumb-in-middle bug).
+    let mid = max * 0.45;
+    engine
+        .send_command(Command::Scroll { offset: mid })
+        .expect("scroll mid");
+    engine.finish_pending_file_window_for_test();
+    engine.rebuild_if_needed_for_test();
+    let mid_global = engine.stats_scroll_y_for_test();
+    let mid_max = engine.max_scroll_offset_for_test();
+    assert!(
+        mid_global <= mid_max + 1.0,
+        "stats must not exceed max (global={mid_global} max={mid_max})"
+    );
+    let (cur_mid, tot_mid) = engine.viewport_line_position_for_test();
+    assert_eq!(tot_mid, total);
+    assert!(
+        cur_mid < tot_mid,
+        "mid scroll must not show N / N (cur={cur_mid} tot={tot_mid})"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn large_file_open_pins_viewport_to_eof() {
+    use crate::engine::Engine;
+    use std::io::Write;
+
+    let path = std::env::temp_dir().join(format!("noviewlog-open-eof-{}.log", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&path).unwrap();
+        // Short lines: 800 lines << 2 MiB tail seek — reproduces the ~8k-line
+        // gap between the initial tail chunk and true EOF on multi-hundred-k files.
+        for i in 0..250_000 {
+            writeln!(f, "access-{i:06} GET /path HTTP/1.1 200 42").unwrap();
+        }
+    }
+    let mut engine = Engine::new();
+    engine
+        .send_command_json(r#"{"cmd":"resize","width":800,"height":400}"#)
+        .expect("resize");
+    let path_str = path.to_string_lossy().replace('\\', "\\\\");
+    engine
+        .send_command_json(&format!(r#"{{"cmd":"load_file","path":"{path_str}"}}"#))
+        .expect("load_file");
+    engine.finish_file_load_for_test();
+    engine.finish_pending_file_window_for_test();
+    engine.rebuild_if_needed_for_test();
+
+    let total = engine.file_total_lines_for_test();
+    let window = engine.file_view_window_lines_for_test() as u64;
+    assert!(total > window + crate::file_load::FILE_INITIAL_WINDOW_LINES as u64);
+    assert!(
+        engine.at_scroll_bottom(),
+        "open must pin global scroll to EOF"
+    );
+    let (cur, tot) = engine.viewport_line_position_for_test();
+    assert_eq!(cur, total, "status line must show N / N at EOF");
+    assert_eq!(tot, total);
+    assert_eq!(
+        engine.buffer_line_start_for_test(),
+        total.saturating_sub(window),
+        "resident window must be the last file window"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn file_scrollbar_aim_holds_global_y_while_window_pending() {
+    use crate::engine::{Command, Engine};
+    use std::io::Write;
+
+    let path =
+        std::env::temp_dir().join(format!("noviewlog-scroll-aim-{}.log", std::process::id()));
+    {
+        let mut f = std::fs::File::create(&path).unwrap();
+        for i in 0..200_000 {
+            writeln!(f, "line-{i:06}").unwrap();
+        }
+    }
+    let mut engine = Engine::new();
+    engine
+        .send_command_json(r#"{"cmd":"resize","width":800,"height":400}"#)
+        .expect("resize");
+    let path_str = path.to_string_lossy().replace('\\', "\\\\");
+    engine
+        .send_command_json(&format!(r#"{{"cmd":"load_file","path":"{path_str}"}}"#))
+        .expect("load_file");
+    engine.finish_file_load_for_test();
+    engine.finish_pending_file_window_for_test();
+
+    let mid = engine.max_scroll_offset_for_test() * 0.42;
+    engine
+        .send_command(Command::Scroll { offset: mid })
+        .expect("scroll mid");
+    assert!(
+        engine.pending_file_window_for_test(),
+        "mid scroll must request a window read"
+    );
+    assert!(
+        (engine.stats_scroll_y_for_test() - mid).abs() < 2.0,
+        "stats scroll_y must track the thumb target while pending (got {} want {})",
+        engine.stats_scroll_y_for_test(),
+        mid
     );
 
     let _ = std::fs::remove_file(&path);
@@ -850,17 +1045,28 @@ fn at_scroll_bottom_uses_global_space_for_file_sessions() {
         .send_command_json(&format!(r#"{{"cmd":"load_file","path":"{path_str}"}}"#))
         .expect("load_file");
     engine.finish_file_load_for_test();
+    engine.finish_pending_file_window_for_test();
+    engine.rebuild_if_needed_for_test();
 
     let total = engine.file_total_lines_for_test();
     let window = engine.file_view_window_lines_for_test() as u64;
     assert!(total > window * 2);
     assert!(
-        !engine.at_scroll_bottom(),
-        "fresh open shows the top, not the bottom"
+        engine.at_scroll_bottom(),
+        "large file open must land at EOF (global scroll bottom)"
     );
+    let (cur, tot) = engine.viewport_line_position_for_test();
+    assert_eq!(tot, total);
+    assert_eq!(cur, tot, "EOF open must read N / N, got {cur} / {tot}");
 
-    // Wheel to the bottom of the resident window while it is mid-file:
+    // Jump to mid-file, then wheel to the bottom of that resident window:
     // local scroll is maxed but more file remains below the window.
+    let mid = engine.max_scroll_offset_for_test() / 2.0;
+    engine
+        .send_command(Command::Scroll { offset: mid })
+        .expect("scroll mid");
+    engine.finish_pending_file_window_for_test();
+    engine.rebuild_if_needed_for_test();
     for _ in 0..window {
         engine
             .send_command(Command::ScrollLines { delta: 3 })
@@ -1335,12 +1541,8 @@ fn stale_id_commands_surface_status_instead_of_silence() {
 
 /// Load a fresh temp file into a dedicated engine file session and run the
 /// baseline change-detection sweep (file unchanged at this point).
-fn load_file_session(engine: &mut crate::engine::Engine, path: &std::path::Path) {
-    let path_str = path.to_string_lossy().replace('\\', "\\\\");
-    engine
-        .send_command_json(&format!(r#"{{"cmd":"load_file","path":"{path_str}"}}"#))
-        .expect("load_file");
-    engine.finish_file_load_for_test();
+fn load_file_session(engine: &mut Engine, path: &Path) {
+    load_file_now(engine, path);
     engine.tick();
     assert!(
         !engine.active_terminal().file_changed,
@@ -1570,30 +1772,19 @@ fn parse_stats_for_watch(event_json: &str) -> Option<bool> {
 fn match_scan_cap_surfaces_truncation_in_status_and_stats() {
     // Issue #150: hitting MAX_MATCH_OFFSETS must flag the view, status, and
     // stats instead of silently truncating. Reduced cap keeps the test small.
-    use crate::engine::Engine;
     use serde_json::Value;
-    use std::io::Write;
-    use std::thread;
-    use std::time::Duration;
 
-    let path = std::env::temp_dir().join(format!("noviewlog-match-hint-{}", std::process::id()));
-    {
-        let mut f = std::fs::File::create(&path).unwrap();
-        for i in 0..200 {
-            writeln!(f, "error line-{i:03} payload").unwrap();
-        }
-    }
+    let path = temp_log_file(
+        "match-hint",
+        (0..200).map(|i| format!("error line-{i:03} payload")),
+    );
 
     let mut engine = Engine::new();
     engine
         .send_command_json(r#"{"cmd":"resize","width":800,"height":400}"#)
         .expect("resize");
     engine.set_match_scan_cap_for_test(50);
-    let path_str = path.to_string_lossy().replace('\\', "\\\\");
-    engine
-        .send_command_json(&format!(r#"{{"cmd":"load_file","path":"{path_str}"}}"#))
-        .expect("load_file");
-    engine.finish_file_load_for_test();
+    load_file_now(&mut engine, &path);
 
     engine
         .send_command_json(r#"{"cmd":"tab_add"}"#)
@@ -1622,16 +1813,7 @@ fn match_scan_cap_surfaces_truncation_in_status_and_stats() {
     );
 
     // Stats snapshot carries the hint for the UI chrome.
-    thread::sleep(Duration::from_millis(260));
-    engine.tick();
-    let mut stats = None;
-    while let Some(ev) = engine.poll_event_json() {
-        let v: Value = serde_json::from_str(&ev).unwrap();
-        if v["type"] == "stats" {
-            stats = Some(v);
-        }
-    }
-    let parsed = stats.expect("stats event");
+    let parsed = drain_stats(&mut engine);
     assert_eq!(
         parsed["match_capped"],
         Value::Bool(true),
@@ -1662,8 +1844,6 @@ fn match_scan_cap_surfaces_truncation_in_status_and_stats() {
         !engine.match_capped_for_test(),
         "complete scan must not flag truncation"
     );
-
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -1717,52 +1897,11 @@ fn viewport_line_position_reads_top_of_viewport() {
 
 #[test]
 fn closing_filter_tab_cancels_inflight_match_scan() {
-    use crate::engine::Engine;
-    use std::io::Write;
-    use std::sync::atomic::Ordering;
-
-    let path = std::env::temp_dir().join(format!(
-        "noviewlog-tab-close-cancel-{}.log",
-        std::process::id()
-    ));
-    {
-        let mut f = std::fs::File::create(&path).unwrap();
-        for i in 0..80_000 {
-            writeln!(f, "ts=10:00:00 line-{i}").unwrap();
-        }
-    }
-    let mut engine = Engine::new();
-    engine
-        .send_command_json(r#"{"cmd":"resize","width":800,"height":400}"#)
-        .expect("resize");
-    let path_str = path.to_string_lossy().replace('\\', "\\\\");
-    engine
-        .send_command_json(&format!(r#"{{"cmd":"load_file","path":"{path_str}"}}"#))
-        .expect("load_file");
-    engine.finish_file_load_for_test();
-
-    engine
-        .send_command_json(r#"{"cmd":"tab_add"}"#)
-        .expect("tab_add");
-    engine
-        .send_command_json(r#"{"cmd":"filter_add","type":"include","pattern":"10:00:00"}"#)
-        .expect("filter_add");
-    assert!(
-        engine.match_scan_pos_for_test().is_some(),
-        "scan must be in flight"
+    let log = temp_log_file(
+        "tab-close-cancel",
+        (0..80_000).map(|i| format!("ts=10:00:00 line-{i}")),
     );
-    // Spawning the scan worker is what installs the cancel flag in the view.
-    engine.advance_file_match_scan();
-
-    // The cancel flag lives in the view; the test keeps its own handle so the
-    // assertion survives close_tab dropping the view.
-    let cancel = engine
-        .active_terminal()
-        .active_view()
-        .match_scan_cancel
-        .clone()
-        .expect("in-flight scan must own a cancel flag");
-    assert!(!cancel.load(Ordering::Relaxed));
+    let (mut engine, cancel) = engine_with_inflight_match_scan(&log);
 
     engine
         .send_command_json(r#"{"cmd":"tab_close","index":1}"#)
@@ -1771,58 +1910,17 @@ fn closing_filter_tab_cancels_inflight_match_scan() {
         cancel.load(Ordering::Relaxed),
         "closing the filter tab must cancel the in-flight scan (#237)"
     );
-
-    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
 fn closing_terminal_cancels_inflight_match_scan() {
     // Issue #255: same leak class as #237 — `terminal_close` must flip the
     // in-flight scan's cancel flag before dropping the terminal.
-    use crate::engine::Engine;
-    use std::io::Write;
-    use std::sync::atomic::Ordering;
-
-    let path = std::env::temp_dir().join(format!(
-        "noviewlog-terminal-close-cancel-{}.log",
-        std::process::id()
-    ));
-    {
-        let mut f = std::fs::File::create(&path).unwrap();
-        for i in 0..80_000 {
-            writeln!(f, "ts=10:00:00 line-{i}").unwrap();
-        }
-    }
-    let mut engine = Engine::new();
-    engine
-        .send_command_json(r#"{"cmd":"resize","width":800,"height":400}"#)
-        .expect("resize");
-    let path_str = path.to_string_lossy().replace('\\', "\\\\");
-    engine
-        .send_command_json(&format!(r#"{{"cmd":"load_file","path":"{path_str}"}}"#))
-        .expect("load_file");
-    engine.finish_file_load_for_test();
-
-    engine
-        .send_command_json(r#"{"cmd":"tab_add"}"#)
-        .expect("tab_add");
-    engine
-        .send_command_json(r#"{"cmd":"filter_add","type":"include","pattern":"10:00:00"}"#)
-        .expect("filter_add");
-    assert!(
-        engine.match_scan_pos_for_test().is_some(),
-        "scan must be in flight"
+    let log = temp_log_file(
+        "terminal-close-cancel",
+        (0..80_000).map(|i| format!("ts=10:00:00 line-{i}")),
     );
-    // Spawning the scan worker is what installs the cancel flag in the view.
-    engine.advance_file_match_scan();
-
-    let cancel = engine
-        .active_terminal()
-        .active_view()
-        .match_scan_cancel
-        .clone()
-        .expect("in-flight scan must own a cancel flag");
-    assert!(!cancel.load(Ordering::Relaxed));
+    let (mut engine, cancel) = engine_with_inflight_match_scan(&log);
 
     // The boot terminal is a live session, so closing the FILES session is
     // allowed; the whole terminal (and its filter tab) is dropped.
@@ -1833,10 +1931,7 @@ fn closing_terminal_cancels_inflight_match_scan() {
         cancel.load(Ordering::Relaxed),
         "closing the terminal must cancel the in-flight scan (#255)"
     );
-
-    let _ = std::fs::remove_file(&path);
 }
-
 #[test]
 fn restart_clears_pending_stdin() {
     // Issue #255: type-ahead buffered before a restart must not flush into

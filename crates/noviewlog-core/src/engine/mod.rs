@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::core::config::{
-    build_runtime_config, load_bundled_config, load_config_from_yaml, load_preset,
+    build_runtime_config, load_bundled_config, load_config_from_yaml_checked, load_preset,
     load_projects_store, load_user_config, missing_default_preset_warning, save_user_config,
 };
 use crate::core::formats::{get_builtin_format, merge_formats};
@@ -17,7 +17,6 @@ use crate::core::types::TabConfig;
 use crate::core::types::{
     clamp_max_scrollback_lines, clamp_viewport_font_size, compile_filter_checked, next_filter_id,
     AppConfig, FilterRule, FilterType, LaunchConfig, LogFormat, PresetConfig, ProjectsStore,
-    DEFAULT_MAX_SCROLLBACK_LINES,
 };
 use crate::core::visible::SearchPattern;
 use crate::file_index::{PREFETCH_RAW_LINES, WINDOW_RAW_LINES};
@@ -35,10 +34,9 @@ use crate::viewport_layout::{
 };
 use portable_pty::PtySize;
 
-/// Default / legacy alias for the scrollback retention cap (records ≈ lines).
-pub const MAX_RECORDS: usize = DEFAULT_MAX_SCROLLBACK_LINES;
 const PENDING_IDLE_FLUSH: Duration = Duration::from_millis(120);
 /// Terminal tab block caret blink half-period (~classic terminal rate).
+/// Host-owned (Slint timer); the engine does not toggle blink itself.
 pub const CARET_BLINK_PERIOD: Duration = Duration::from_millis(530);
 
 /// Empty Terminal-tab hint when the process session is stopped (ASCII only).
@@ -146,10 +144,7 @@ pub struct Engine {
     /// When true, the first tick auto-starts the active program.
     /// CLI launch only — never set for Project open / last-Project restore.
     pub(crate) auto_start_launch: bool,
-    /// Terminal tab block-caret blink: visible when true; toggled on [`CARET_BLINK_PERIOD`].
-    pub(crate) caret_blink_on: bool,
-    pub(crate) caret_blink_at: Instant,
-    /// Host viewport has keyboard focus — caret only blinks when true.
+    /// Host viewport has keyboard focus — caret overlay only shown when true.
     pub(crate) viewport_focused: bool,
     /// FILTERS draft preview (UI-global): pattern text + compiled highlight.
     pub(crate) filter_draft_query: String,
@@ -161,12 +156,20 @@ pub struct Engine {
     pub(crate) config_dirty: bool,
     /// Last persistence-relevant change; the deferred write lands after
     /// [`PERSIST_DEBOUNCE`] of quiet (or immediately at engine drop).
-    pub(crate) persist_changed_at: Option<Instant>,
+    /// Per store (issue #326): one store's scheduling must not wait on — or
+    /// be reset by — the other.
+    pub(crate) projects_persist_changed_at: Option<Instant>,
+    /// Same as [`Self::projects_persist_changed_at`] for `config.yaml`.
+    pub(crate) config_persist_changed_at: Option<Instant>,
     /// Delay before the next persist retry; grows ×4 per consecutive failure
     /// up to [`PERSIST_RETRY_MAX`] so a permanently failing save (read-only
     /// config dir, full disk) does not push a status event every debounce
-    /// period (issue #237). Reset on a successful save.
-    pub(crate) persist_retry_delay: Duration,
+    /// period (issue #237). Reset on a successful save of the SAME store —
+    /// per store (issue #326): a projects success must not reset the config
+    /// store's failure backoff.
+    pub(crate) projects_persist_retry_delay: Duration,
+    /// Same as [`Self::projects_persist_retry_delay`] for `config.yaml`.
+    pub(crate) config_persist_retry_delay: Duration,
     /// True once the current projects-store persist failure streak has
     /// surfaced a status event; later retries stay silent until that store
     /// saves successfully (issue #237, per-store tracking per issue #253).
@@ -176,6 +179,13 @@ pub struct Engine {
     /// When true (tests only), persist saves report failure (issue #237 tests).
     #[cfg(test)]
     pub(crate) persist_fail_saves: bool,
+    /// When true (tests only), only the projects store reports failure —
+    /// drives per-store backoff tests (issue #326).
+    #[cfg(test)]
+    pub(crate) persist_fail_projects_only: bool,
+    /// When true (tests only), only the config store reports failure.
+    #[cfg(test)]
+    pub(crate) persist_fail_config_only: bool,
     /// When true (tests only), do not write `projects.yaml` / `config.yaml`.
     #[cfg(test)]
     pub(crate) skip_projects_persist: bool,
@@ -235,14 +245,9 @@ impl Engine {
             .cloned()
             .unwrap_or_else(|| get_builtin_format("node-default"));
 
-        let id = next_terminal_id(&[]);
-        let terminal = TerminalState::new(
-            id,
-            LaunchConfig::default(),
-            &runtime,
-            &default_format,
-            max_scrollback,
-        );
+        let id = next_terminal_id();
+        let terminal =
+            TerminalState::new(id, LaunchConfig::default(), &default_format, max_scrollback);
 
         let (projects, projects_warning) = load_projects_store();
         if let Some(msg) = projects_warning {
@@ -280,16 +285,16 @@ impl Engine {
             last_viewport_paint_at: None,
             last_pty_poll_at: None,
             auto_start_launch: false,
-            caret_blink_on: true,
-            caret_blink_at: Instant::now(),
             viewport_focused: false,
             filter_draft_query: String::new(),
             filter_draft_regex: false,
             filter_draft_pattern: None,
             projects_dirty: false,
             config_dirty: false,
-            persist_changed_at: None,
-            persist_retry_delay: PERSIST_DEBOUNCE,
+            projects_persist_changed_at: None,
+            config_persist_changed_at: None,
+            projects_persist_retry_delay: PERSIST_DEBOUNCE,
+            config_persist_retry_delay: PERSIST_DEBOUNCE,
             projects_failure_announced: false,
             config_failure_announced: false,
             // Unit tests must never touch the developer's real projects/config.
@@ -297,6 +302,10 @@ impl Engine {
             skip_projects_persist: cfg!(test),
             #[cfg(test)]
             persist_fail_saves: false,
+            #[cfg(test)]
+            persist_fail_projects_only: false,
+            #[cfg(test)]
+            persist_fail_config_only: false,
             config_persist_disabled: false,
             spawn_resolver: SpawnResolver::new(),
             spawn_prewarm_seen: std::collections::HashSet::new(),
@@ -322,21 +331,18 @@ impl Engine {
 
     pub(crate) fn ensure_valid_state(&mut self) {
         if self.terminals.is_empty() {
-            let runtime = build_runtime_config(&self.config, Some(&self.preset_name));
             let format = self.current_format();
-            let id = next_terminal_id(&[]);
+            let id = next_terminal_id();
             self.terminals.push(TerminalState::new(
                 id,
                 LaunchConfig::default(),
-                &runtime,
                 &format,
                 self.config.max_scrollback_lines,
             ));
             self.active_terminal = 0;
         }
         self.active_terminal = self.active_terminal.min(self.terminals.len() - 1);
-        let runtime = build_runtime_config(&self.config, Some(&self.preset_name));
-        self.terminals[self.active_terminal].ensure_terminal_tab_view(&runtime);
+        self.terminals[self.active_terminal].ensure_terminal_tab_view();
     }
 
     pub(crate) fn active_terminal(&self) -> &TerminalState {
@@ -429,7 +435,7 @@ impl Engine {
                 self.snap_follow_scroll_after_ingest(idx);
             }
         }
-        self.tick_caret_blink();
+        self.maybe_apply_open_eof_scroll();
         self.emit_stats();
     }
 
@@ -560,12 +566,6 @@ impl Engine {
         last.elapsed() < VIEWPORT_PAINT_MIN_INTERVAL
     }
 
-    /// Reset blink phase (host shows overlay immediately while typing / on focus).
-    pub fn reset_caret_blink(&mut self) {
-        self.caret_blink_on = true;
-        self.caret_blink_at = Instant::now();
-    }
-
     /// TUI hosts: set PTY + ingest geometry directly in **cell units**.
     /// [`Command::Resize`] is viewport-pixel based (bitmap hosts); a TUI
     /// terminal emulator hands us columns/rows, not pixels, and has no font
@@ -612,6 +612,9 @@ impl Engine {
     pub fn at_scroll_bottom(&self) -> bool {
         if !self.has_active_terminal() {
             return true;
+        }
+        if self.active_terminal().pending_file_window.is_some() {
+            return false;
         }
         // File/match sessions keep `scroll_offset_y` local to the resident
         // window (issue #195); `stats_scroll_y()` maps it into the same global
@@ -720,14 +723,8 @@ impl Engine {
                 }
             }
         };
-        match write_result {
-            WriteOutcome::Written | WriteOutcome::Buffered => {
-                // Keep the caret visible while typing (same as a real terminal).
-                self.reset_caret_blink();
-            }
-            WriteOutcome::Failed(err) => {
-                self.push_event(json!({"type":"status","message": format!("stdin: {err}")}));
-            }
+        if let WriteOutcome::Failed(err) = write_result {
+            self.push_event(json!({"type":"status","message": format!("stdin: {err}")}));
         }
     }
 

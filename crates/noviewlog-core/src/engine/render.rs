@@ -43,11 +43,6 @@ impl Engine {
         self.last_viewport_paint_at = Some(Instant::now());
     }
 
-    /// Character grid size for the PTY / VT emulator.
-    ///
-    /// Rows track the viewport. Cols are `max(viewport_cols, MIN_PTY_COLS)` so a
-    /// wide window is not capped at the old fixed 120, while a narrow window
-    /// still gets a wide logical line buffer for soft-wrap / horizontal scroll.
     pub(crate) fn set_viewport_focus(&mut self, focused: bool) {
         if self.viewport_focused == focused {
             return;
@@ -55,9 +50,13 @@ impl Engine {
         self.viewport_focused = focused;
         // Overlay caret is host-drawn; content paint is unchanged by focus alone.
         // Unfocus: no need to dirty the bitmap (caret overlay hides independently).
-        let _ = focused;
     }
 
+    /// Character grid size for the PTY / VT emulator.
+    ///
+    /// Rows track the viewport. Cols are `max(viewport_cols, MIN_PTY_COLS)` so a
+    /// wide window is not capped at the old fixed 120, while a narrow window
+    /// still gets a wide logical line buffer for soft-wrap / horizontal scroll.
     pub(crate) fn viewport_pty_size(&self) -> PtySize {
         let metrics = self.renderer.metrics();
         let viewport_cols = max_cols(content_width(self.viewport_width), metrics.cell_width)
@@ -188,19 +187,29 @@ impl Engine {
         ) = {
             let terminal = self.active_terminal();
             let view = terminal.active_view();
+            // Find chrome owns search: a live query pins the viewport on matches
+            // (no Follow). Closing Find must SearchSet empty or this stays frozen.
+            // File sessions never Follow.
+            let auto_follow =
+                !terminal.is_file_session() && view.auto_follow && view.search_query.is_empty();
+            let wrap_lines = view.wrap_lines;
+            let flat_lines = Arc::clone(&view.flat_lines);
+            let search_pattern = view.search_pattern.clone();
+            let active_match = view.search_matches.get(view.search_match_index).copied();
+            let running = terminal.running;
+            let scroll_offset_y = terminal.scroll_offset_y;
+            let scroll_x = terminal.scroll_x;
+            let selection = terminal.selection;
             (
-                // Find chrome owns search: a live query pins the viewport on matches
-                // (no Follow). Closing Find must SearchSet empty or this stays frozen.
-                // File sessions never Follow.
-                !terminal.is_file_session() && view.auto_follow && view.search_query.is_empty(),
-                view.wrap_lines,
-                Arc::clone(&view.flat_lines),
-                view.search_pattern.clone(),
-                view.search_matches.get(view.search_match_index).copied(),
-                terminal.running,
-                terminal.scroll_offset_y,
-                terminal.scroll_x,
-                terminal.selection,
+                auto_follow,
+                wrap_lines,
+                flat_lines,
+                search_pattern,
+                active_match,
+                running,
+                scroll_offset_y,
+                scroll_x,
+                selection,
             )
         };
         let filter_draft_pattern = self.filter_draft_pattern.clone();
@@ -211,8 +220,7 @@ impl Engine {
             let rows =
                 self.active_view()
                     .cached_visual_rows(width, metrics.cell_width, count_visual_rows);
-            let content_h = rows as f32 * metrics.row_stride;
-            let new_scroll = (content_h - height as f32).max(0.0);
+            let new_scroll = super::caret::follow_scroll_y(rows, metrics.row_stride, height);
             if (new_scroll - scroll_offset_y).abs() > 0.01 {
                 self.mark_viewport_dirty();
             }

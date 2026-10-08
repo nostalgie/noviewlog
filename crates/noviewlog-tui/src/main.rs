@@ -39,6 +39,12 @@ const FRAME_BUDGET: Duration = Duration::from_millis(16);
 /// Double-click window for record expand/collapse.
 const DOUBLE_CLICK: Duration = Duration::from_millis(350);
 
+/// Inner width of the context menu box (see [`App::menu_width`]).
+const MENU_WIDTH: u16 = 24;
+/// Full menu box width: inner width plus the left/right border columns.
+/// The click position clamps to `cols - MENU_BOX_COLS` so the box fits.
+const MENU_BOX_COLS: u16 = MENU_WIDTH + 2;
+
 /// Right-click context menu rendered as a text overlay on the grid.
 struct Menu {
     /// Screen row/col of the box top-left.
@@ -266,7 +272,9 @@ impl App {
         if key.kind != KeyEventKind::Press {
             return Some(());
         }
-        // Quit: Ctrl+Q with y/N confirm (typed text still reaches the shell).
+        // Quit: the first Ctrl+Q arms the confirm prompt, a second Ctrl+Q
+        // quits. While armed, any other key only disarms it: the code
+        // consumes that key and forwards nothing to the shell.
         if key.modifiers.contains(KeyModifiers::CONTROL)
             && matches!(key.code, KeyCode::Char('q') | KeyCode::Char('Q'))
         {
@@ -376,14 +384,7 @@ impl App {
         // Ctrl+Shift+C copies the current selection (terminal convention);
         // consumed here so it never reaches the shell as a Ctrl+C.
         if ctrl && key.modifiers.contains(KeyModifiers::SHIFT) {
-            if let (Some(a), Some(b)) = (self.sel_anchor, self.sel_current) {
-                if a != b {
-                    let text = self.selected_text(a.min(b), a.max(b));
-                    if !text.is_empty() {
-                        copy_to_clipboard(&text);
-                    }
-                }
-            }
+            self.copy_current_selection();
             return Some(());
         }
         // Transparent terminal: everything goes to the wrapped shell.
@@ -445,7 +446,7 @@ impl App {
     /// clamp the painter uses, so the hit region only covers visibly drawn
     /// cells at any terminal width (#254).
     pub(crate) fn menu_width(col: u16, cols: u16) -> u16 {
-        24u16.min(cols.saturating_sub(col))
+        MENU_WIDTH.min(cols.saturating_sub(col))
     }
 
     fn handle_mouse(&mut self, m: MouseEvent) {
@@ -506,8 +507,7 @@ impl App {
                 // hardcoded row budget (P3-12).
                 let menu_rows = items.len() as u16 + 2;
                 let row = m.row.min(self.rows.saturating_sub(menu_rows));
-                let col = m.column.min(self.cols.saturating_sub(26));
-                let content_row = m.row.saturating_sub(1) as usize;
+                let col = m.column.min(self.cols.saturating_sub(MENU_BOX_COLS));
                 let ctx = self.row_records.get(content_row).copied().flatten();
                 let line_text = self
                     .visible
@@ -530,114 +530,16 @@ impl App {
                 });
             }
             MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                // Connect overlay: click on an item starts that session;
-                // Esc/outside falls back to the local shell.
+                // Priority: connect overlay, then context menu, then the tab
+                // bar (row 0), then the content area.
                 if self.connect_open {
-                    // Box geometry matches the painter: title row at orow+1,
-                    // items start at orow+2.
-                    let (ocol, orow, items) = self.connect_geo();
-                    let box_cols = Self::connect_box_width(ocol, self.cols);
-                    let idx = if m.column >= ocol
-                        && m.column < ocol.saturating_add(box_cols).saturating_add(2)
-                        && m.row >= orow + 2
-                        && ((m.row - orow - 2) as usize) < items
-                    {
-                        Some((m.row - orow - 2) as usize)
-                    } else {
-                        None
-                    };
-                    self.connect_sel = idx.unwrap_or(0);
-                    self.connect_open = false;
-                    let choice = self.connect_choice(idx.unwrap_or(usize::MAX));
-                    match choice {
-                        Some(c) => {
-                            let _ = self.start_session(c);
-                        }
-                        None if self.session.is_none() => {
-                            // Dismissed with no session yet: default to local.
-                            let _ = self.start_session(SessionChoice::Local);
-                        }
-                        _ => {}
-                    }
-                    return;
-                }
-                if let Some(menu) = &self.menu {
-                    let items = menu.items.clone();
-                    let record_id = menu.record_id;
-                    let line_text = menu.line_text.clone();
-                    let (mrow, mcol) = (menu.row, menu.col);
-                    self.menu = None;
-                    // Hit-test: item 0 = the row below the top border; the
-                    // bottom border maps to a no-op index.
-                    let in_box = m.column >= mcol
-                        && m.column < mcol.saturating_add(Self::menu_width(mcol, self.cols));
-                    let idx = if in_box {
-                        menu_hit(mrow, m.row, items.len())
-                    } else {
-                        None
-                    };
-                    if let Some(idx) = idx {
-                        match idx {
-                            0 if record_id.is_some() => {
-                                self.cmd(Command::RecordCollapseToggle {
-                                    record_id: record_id.unwrap(),
-                                });
-                            }
-                            1 => copy_to_clipboard(&line_text),
-                            2 if !line_text.is_empty() => {
-                                self.cmd(Command::FilterAdd {
-                                    filter_type: FilterType::Include,
-                                    pattern: line_text,
-                                    regex: false,
-                                });
-                            }
-                            3 => self.cmd(Command::FilterClear),
-                            _ => {}
-                        }
-                    }
-                    return;
-                }
-                if m.row == 0 {
-                    if let Some(&(_, _, index)) = self
-                        .tab_spans
-                        .iter()
-                        .find(|&&(s, l, _)| m.column >= s && m.column < s.saturating_add(l))
-                    {
-                        self.cmd(Command::TabSwitch { index });
-                    } else if self
-                        .tab_add_span
-                        .is_some_and(|(s, l)| m.column >= s && m.column < s.saturating_add(l))
-                    {
-                        self.cmd(Command::TabAdd);
-                        self.filter_buf.clear();
-                        self.input_focus = true;
-                    }
-                    return;
-                }
-                if let Some(cell) = self.cell_at(&m) {
-                    // Double-click toggles record expand/collapse; single
-                    // clicks start a text selection.
-                    let now = Instant::now();
-                    let dbl = self.last_click.is_some_and(|((r, c), t)| {
-                        (r, c) == (m.row, m.column) && now.duration_since(t) <= DOUBLE_CLICK
-                    });
-                    self.last_click = Some(((m.row, m.column), now));
-                    if dbl {
-                        if let Some(Some(id)) = self.row_records.get(cell.0) {
-                            self.cmd(Command::RecordCollapseToggle { record_id: *id });
-                        }
-                        self.sel_anchor = None;
-                        self.sel_current = None;
-                        return;
-                    }
-                    self.sel_anchor = Some(cell);
-                    self.sel_current = Some(cell);
+                    self.connect_click(m);
+                } else if self.menu.is_some() {
+                    self.menu_click(m);
+                } else if m.row == 0 {
+                    self.tab_bar_click(m);
                 } else {
-                    // A click outside the content area (tab bar handled above,
-                    // input/status rows) dismisses a stale selection instead
-                    // of leaving a highlight no drag explains.
-                    self.sel_anchor = None;
-                    self.sel_current = None;
+                    self.content_click(m);
                 }
             }
             MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
@@ -653,19 +555,146 @@ impl App {
                 if let Some(cell) = self.cell_at(&m) {
                     self.sel_current = Some(cell);
                 }
-                // Keep the highlight; copy the selected text from the
-                // visible slice on our own (no engine coordinate math).
-                if let (Some(a), Some(b)) = (self.sel_anchor, self.sel_current) {
-                    if a != b {
-                        let text = self.selected_text(a.min(b), a.max(b));
-                        if !text.is_empty() {
-                            copy_to_clipboard(&text);
-                        }
-                    }
-                }
+                self.copy_current_selection();
             }
             _ => {}
         }
+    }
+
+    /// Copy the current selection (if non-empty) to the clipboard. The
+    /// highlight is kept; the text comes from the visible slice on our own
+    /// (no engine coordinate math). Shared by mouse-up and Ctrl+Shift+C.
+    fn copy_current_selection(&self) {
+        if let (Some(a), Some(b)) = (self.sel_anchor, self.sel_current) {
+            if a != b {
+                let text = self.selected_text(a.min(b), a.max(b));
+                if !text.is_empty() {
+                    copy_to_clipboard(&text);
+                }
+            }
+        }
+    }
+
+    /// Left click while the connect overlay is open: an item starts that
+    /// session; outside the box falls back to the local shell (same as Esc).
+    fn connect_click(&mut self, m: MouseEvent) {
+        // Box geometry matches the painter: title row at orow+1, items start
+        // at orow+2.
+        let (ocol, orow, items) = self.connect_geo();
+        let box_cols = Self::connect_box_width(ocol, self.cols);
+        let idx = if m.column >= ocol
+            && m.column < ocol.saturating_add(box_cols).saturating_add(2)
+            && m.row >= orow + 2
+            && ((m.row - orow - 2) as usize) < items
+        {
+            Some((m.row - orow - 2) as usize)
+        } else {
+            None
+        };
+        self.connect_sel = idx.unwrap_or(0);
+        self.connect_open = false;
+        let choice = self.connect_choice(idx.unwrap_or(usize::MAX));
+        match choice {
+            Some(c) => {
+                let _ = self.start_session(c);
+            }
+            None if self.session.is_none() => {
+                // Dismissed with no session yet: default to local.
+                let _ = self.start_session(SessionChoice::Local);
+            }
+            _ => {}
+        }
+    }
+
+    /// Left click while the context menu is open: run the clicked item (if
+    /// any) and always close the menu.
+    fn menu_click(&mut self, m: MouseEvent) {
+        let Some(menu) = self.menu.take() else {
+            return;
+        };
+        let Menu {
+            row: mrow,
+            col: mcol,
+            record_id,
+            line_text,
+            items,
+        } = menu;
+        // Hit-test: item 0 = the row below the top border; the bottom border
+        // maps to a no-op index.
+        let in_box =
+            m.column >= mcol && m.column < mcol.saturating_add(Self::menu_width(mcol, self.cols));
+        let idx = if in_box {
+            menu_hit(mrow, m.row, items.len())
+        } else {
+            None
+        };
+        let Some(idx) = idx else {
+            return;
+        };
+        match idx {
+            0 if record_id.is_some() => {
+                self.cmd(Command::RecordCollapseToggle {
+                    record_id: record_id.unwrap(),
+                });
+            }
+            1 => copy_to_clipboard(&line_text),
+            2 if !line_text.is_empty() => {
+                self.cmd(Command::FilterAdd {
+                    filter_type: FilterType::Include,
+                    pattern: line_text,
+                    regex: false,
+                });
+            }
+            3 => self.cmd(Command::FilterClear),
+            _ => {}
+        }
+    }
+
+    /// Left click on the tab bar (row 0): switch to a tab, or "+" adds a
+    /// filter tab and opens the filter input.
+    fn tab_bar_click(&mut self, m: MouseEvent) {
+        if let Some(&(_, _, index)) = self
+            .tab_spans
+            .iter()
+            .find(|&&(s, l, _)| m.column >= s && m.column < s.saturating_add(l))
+        {
+            self.cmd(Command::TabSwitch { index });
+        } else if self
+            .tab_add_span
+            .is_some_and(|(s, l)| m.column >= s && m.column < s.saturating_add(l))
+        {
+            self.cmd(Command::TabAdd);
+            self.filter_buf.clear();
+            self.input_focus = true;
+        }
+    }
+
+    /// Left click below the tab bar: double-click toggles record
+    /// expand/collapse, a single click starts a text selection, and a click
+    /// outside the content area clears a stale selection.
+    fn content_click(&mut self, m: MouseEvent) {
+        let Some(cell) = self.cell_at(&m) else {
+            // Outside the content area (input/status rows): dismiss a stale
+            // selection instead of leaving a highlight no drag explains.
+            self.sel_anchor = None;
+            self.sel_current = None;
+            return;
+        };
+        let now = Instant::now();
+        let dbl = self.last_click.is_some_and(|((r, c), t)| {
+            (r, c) == (m.row, m.column) && now.duration_since(t) <= DOUBLE_CLICK
+        });
+        self.last_click = Some(((m.row, m.column), now));
+        if dbl {
+            if let Some(Some(id)) = self.row_records.get(cell.0) {
+                self.cmd(Command::RecordCollapseToggle { record_id: *id });
+            }
+            self.sel_anchor = None;
+            self.sel_current = None;
+            return;
+        }
+        self.sel_anchor = Some(cell);
+        self.sel_current = Some(cell);
     }
 
     /// Text of the selected span across the visible slice (inclusive of the
@@ -978,6 +1007,7 @@ fn main() {
 /// CLI: `--ssh <target>` (connect now, with `--port <n>` and repeatable
 /// `--ssh-arg <arg>`), `--profile <name>` (saved profile), `--connect`
 /// (profile list overlay), no args = local shell (unchanged).
+#[derive(Debug)]
 enum CliChoice {
     Local,
     Ssh(SessionChoice),
@@ -993,23 +1023,25 @@ pub(crate) fn config_path_label() -> String {
 
 fn parse_cli() -> Result<CliChoice, String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    parse_cli_from(&args)
+}
+
+fn parse_cli_from(args: &[String]) -> Result<CliChoice, String> {
     let mut iter = args.iter();
     let mut choice = CliChoice::Local;
     // `--port` / `--ssh-arg` accumulate and apply to the `--ssh` target
-    // (defaults keep the plain `ssh -t <target>` argv).
+    // regardless of flag order (issue #348): the target's argv is built
+    // after the scan. `--port` keeps its last value, `--ssh-arg` collects
+    // all occurrences; a repeated `--ssh` means the last target wins.
     let mut port: u16 = 0;
     let mut extra: Vec<String> = Vec::new();
+    let mut ssh: Option<String> = None;
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--ssh" => {
                 let target = iter.next().ok_or("--ssh requires a target (user@host)")?;
                 ssh::probe_ssh_client()?;
-                choice = CliChoice::Ssh(SessionChoice::Ssh {
-                    label: target.clone(),
-                    argv: ssh::argv_from_cli_flags(target, port, &extra),
-                });
-                port = 0;
-                extra.clear();
+                ssh = Some(target.clone());
             }
             "--port" => {
                 let v = iter.next().ok_or("--port requires a port number")?;
@@ -1031,18 +1063,28 @@ fn parse_cli() -> Result<CliChoice, String> {
                     )
                 })?;
                 ssh::probe_ssh_client()?;
+                ssh = None;
                 choice = CliChoice::Ssh(SessionChoice::Ssh {
                     label: format!("{} ({})", p.name, p.target),
                     argv: ssh::argv_for_profile(p),
                 });
             }
-            "--connect" => choice = CliChoice::Connect,
+            "--connect" => {
+                ssh = None;
+                choice = CliChoice::Connect;
+            }
             other => {
                 return Err(format!(
                     "unknown argument `{other}` (use --ssh, --profile, --connect)"
                 ))
             }
         }
+    }
+    if let Some(target) = ssh {
+        choice = CliChoice::Ssh(SessionChoice::Ssh {
+            label: target.clone(),
+            argv: ssh::argv_from_cli_flags(&target, port, &extra),
+        });
     }
     Ok(choice)
 }
@@ -1304,6 +1346,15 @@ mod tests {
         assert_eq!(app.selected_text((0, 4), (0, 5)), "ab");
     }
 
+    #[test]
+    fn selected_text_includes_release_cell_like_highlight() {
+        // Drag anchor→current must copy the release cell too (end-inclusive),
+        // matching the painted highlight (#350).
+        let app = app_with_visible_lines(&["hello"]);
+        assert_eq!(app.selected_text((0, 0), (0, 4)), "hello");
+        assert_eq!(app.selected_text((0, 1), (0, 3)), "ell");
+    }
+
     /// Minimal App for selection tests: engine built off-session, one
     /// pre-populated visible slice (no terminal, no PTY).
     fn app_with_visible_lines(lines: &[&str]) -> App {
@@ -1559,5 +1610,59 @@ mod tests {
                 KeyModifiers::CONTROL | KeyModifiers::SHIFT
             ))
             .is_some());
+    }
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+
+    fn ssh_argv(args: &[&str]) -> Vec<String> {
+        let owned: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+        match parse_cli_from(&owned).expect("parse ok") {
+            CliChoice::Ssh(SessionChoice::Ssh { argv, .. }) => argv,
+            other => panic!("expected ssh choice, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ssh_flags_after_target_apply() {
+        // Issue #348: the natural order connected to port 22 silently.
+        assert!(
+            ssh_argv(&["--ssh", "web01", "--port", "2222"])
+                .windows(2)
+                .any(|w| w == ["-p", "2222"]),
+            "--port after --ssh must reach the argv"
+        );
+    }
+
+    #[test]
+    fn ssh_flags_before_target_apply() {
+        assert!(
+            ssh_argv(&["--port", "2222", "--ssh", "web01"])
+                .windows(2)
+                .any(|w| w == ["-p", "2222"]),
+            "--port before --ssh must reach the argv"
+        );
+    }
+
+    #[test]
+    fn ssh_args_apply_to_last_target() {
+        let argv = ssh_argv(&["--ssh-arg", "-v", "--ssh", "web01", "--ssh-arg", "-o"]);
+        assert!(argv.contains(&"-o".to_string()), "post-target --ssh-arg");
+        assert!(argv.contains(&"-v".to_string()), "pre-target --ssh-arg");
+    }
+
+    #[test]
+    fn later_ssh_resets_and_wins() {
+        let argv = ssh_argv(&["--ssh", "a", "--port", "1", "--ssh", "b", "--port", "2"]);
+        assert!(argv.windows(2).any(|w| w == ["-p", "2"]));
+        assert!(!argv.windows(2).any(|w| w == ["-p", "1"]));
+    }
+
+    #[test]
+    fn port_without_ssh_stays_local() {
+        let owned: Vec<String> = ["--port", "2222"].iter().map(|s| s.to_string()).collect();
+        assert!(matches!(parse_cli_from(&owned), Ok(CliChoice::Local)));
     }
 }

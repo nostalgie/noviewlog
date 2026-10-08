@@ -1,8 +1,92 @@
 // Sidebar / tab-strip building blocks (terminals list, filters, tabs, scrollbars).
 
-import { Palette } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { CtxAccelMenuItem } from "chrome-menus.slint";
+
+// Inline rename field + commit/cancel state machine shared by TabChip and
+// TerminalRow. The host supplies only chrome (frame, padding, vertical-alignment)
+// and mounts this in `if renaming:` so `init` runs once per rename session.
+//
+// Focus-race guards (real bug history — do not simplify):
+// - `init` focuses the field but `has-focus` can fire false→true late, so blur
+//   only commits after the field has focused once (`had-focus`).
+// - `closing` is a one-shot latch (shared with the host, whose own outside-press
+//   commit uses it too) so Enter / blur / click-away commit exactly once.
+// - Never `self.focus()` on blur (traps the editor); mouse leave must not blur.
+export component InlineRenameInput inherits TextInput {
+    // Host rename session flag; commit/cancel are no-ops once it is false.
+    in property <bool> renaming: false;
+    // Text the field is seeded with on init.
+    in property <string> draft: "";
+    // One-shot guard shared with the host (bind with `closing <=> root.rename-closing`).
+    in-out property <bool> closing: false;
+    callback draft-edited(text: string);
+    callback commit(text: string);
+    callback cancel();
+
+    // Ignore blur until TextInput has focused once (init focus can race has-focus).
+    property <bool> had-focus: false;
+
+    min-width: 1px;
+    font-size: 12px;
+    color: Theme.rename-text;
+    horizontal-alignment: left;
+    selection-background-color: Theme.selection-bg;
+    selection-foreground-color: Theme.selection-fg;
+    single-line: true;
+
+    function finish-accept() {
+        if (root.closing || !root.renaming) {
+            return;
+        }
+        root.closing = true;
+        root.commit(root.text);
+    }
+
+    function finish-cancel() {
+        if (root.closing || !root.renaming) {
+            return;
+        }
+        root.closing = true;
+        root.cancel();
+    }
+
+    // Keep draft in sync so a stats/layout rebuild of the host does not
+    // re-init from a stale seed and wipe in-progress edits.
+    edited => {
+        root.draft-edited(self.text);
+    }
+
+    init => {
+        root.closing = false;
+        root.had-focus = false;
+        self.text = root.draft;
+        self.focus();
+        self.select-all();
+    }
+
+    accepted => {
+        root.finish-accept();
+    }
+
+    // Real focus loss commits. Mouse leave must not blur (gated FocusScopes).
+    changed has-focus => {
+        if (self.has-focus) {
+            root.had-focus = true;
+        } else if (root.had-focus && root.renaming && !root.closing) {
+            root.finish-accept();
+        }
+    }
+
+    key-pressed(event) => {
+        if (event.text == Key.Escape) {
+            root.finish-cancel();
+            accept
+        } else {
+            reject
+        }
+    }
+}
 
 // Root is TouchArea so wheel works over chip padding and the 1px divider
 // (child Rectangles do not steal pointer events).
@@ -17,7 +101,6 @@ export component TabChip inherits TouchArea {
     in property <int> tab-index: 0;
     in property <bool> can-reorder: true;
     in property <bool> show-drop-before: false;
-    in property <bool> show-drop-after: false;
     in property <bool> dim-as-drag-source: false;
     callback close-clicked();
     // Forward wheel so the tab strip can scroll horizontally (Flickable ignores Y-wheel).
@@ -43,9 +126,8 @@ export component TabChip inherits TouchArea {
 
     property <length> ctx-menu-x: 0px;
     property <length> ctx-menu-y: 0px;
+    // One-shot commit/cancel guard, shared with the InlineRenameInput child.
     property <bool> rename-closing: false;
-    // Ignore blur until TextInput has focused once (init focus can race has-focus).
-    property <bool> rename-had-focus: false;
     property <bool> press-tracking: false;
     property <float> press-x: 0;
     property <float> press-y: 0;
@@ -102,7 +184,9 @@ export component TabChip inherits TouchArea {
             }
             return;
         }
-        if (event.button == PointerEventButton.middle && event.kind == PointerEventKind.down) {
+        // Gate with show-close — same contract as the context-menu Close item (#333).
+        // Without this, middle-click on the Terminal tab relied on a Rust backstop.
+        if (root.show-close && event.button == PointerEventButton.middle && event.kind == PointerEventKind.down) {
             root.close-clicked();
             return;
         }
@@ -148,20 +232,13 @@ export component TabChip inherits TouchArea {
         }
     }
 
+    // Click on chip chrome outside the field: same guard as InlineRenameInput.
     function finish-rename-accept(text: string) {
         if (root.rename-closing || !root.renaming) {
             return;
         }
         root.rename-closing = true;
         root.rename-accepted(text);
-    }
-
-    function finish-rename-cancel() {
-        if (root.rename-closing || !root.renaming) {
-            return;
-        }
-        root.rename-closing = true;
-        root.rename-cancelled();
     }
 
     Rectangle {
@@ -175,15 +252,6 @@ export component TabChip inherits TouchArea {
     // Hidden when drop target == source (no-op) so a stuck drag session cannot leave a stripe.
     if root.show-drop-before: Rectangle {
         x: 0px;
-        y: 0px;
-        width: 2px;
-        height: parent.height;
-        background: Theme.text-muted;
-        z: 10;
-    }
-
-    if root.show-drop-after: Rectangle {
-        x: parent.width - 2px;
         y: 0px;
         width: 2px;
         height: parent.height;
@@ -213,61 +281,25 @@ export component TabChip inherits TouchArea {
             background: Theme.rename-bg;
             clip: true;
 
-        HorizontalLayout {
-            width: 100%;
-            height: 100%;
-            padding-left: Theme.field-pad-x;
-            padding-right: Theme.field-pad-x;
-            padding-top: Theme.field-pad-y;
-            padding-bottom: Theme.field-pad-y;
-            alignment: stretch;
+            HorizontalLayout {
+                width: 100%;
+                height: 100%;
+                padding-left: Theme.field-pad-x;
+                padding-right: Theme.field-pad-x;
+                padding-top: Theme.field-pad-y;
+                padding-bottom: Theme.field-pad-y;
+                alignment: stretch;
 
-                rename-edit := TextInput {
+                InlineRenameInput {
                     width: 100%;
                     height: 100%;
-                    min-width: 1px;
-                    font-size: 12px;
-                    color: Theme.rename-text;
-                    horizontal-alignment: left;
                     vertical-alignment: top;
-                    selection-background-color: Theme.selection-bg;
-                    selection-foreground-color: Theme.selection-fg;
-                    single-line: true;
-                    // Keep draft in sync so a stats/layout rebuild of the chip does not
-                    // re-init from a stale rename-text and wipe in-progress edits.
-                    edited => {
-                        root.rename-edited(self.text);
-                    }
-
-                    init => {
-                        root.rename-closing = false;
-                        root.rename-had-focus = false;
-                        self.text = root.rename-text;
-                        self.focus();
-                        self.select-all();
-                    }
-
-                    accepted => {
-                        root.finish-rename-accept(self.text);
-                    }
-
-                    // Real focus loss commits. Mouse leave must not blur (gated FocusScopes).
-                    changed has-focus => {
-                        if (self.has-focus) {
-                            root.rename-had-focus = true;
-                        } else if (root.rename-had-focus && root.renaming && !root.rename-closing) {
-                            root.finish-rename-accept(self.text);
-                        }
-                    }
-
-                    key-pressed(event) => {
-                        if (event.text == Key.Escape) {
-                            root.finish-rename-cancel();
-                            accept
-                        } else {
-                            reject
-                        }
-                    }
+                    renaming: root.renaming;
+                    draft: root.rename-text;
+                    closing <=> root.rename-closing;
+                    draft-edited(text) => { root.rename-edited(text); }
+                    commit(text) => { root.rename-accepted(text); }
+                    cancel => { root.rename-cancelled(); }
                 }
             }
         }
@@ -649,6 +681,77 @@ export component SectionDot inherits Rectangle {
     vertical-stretch: 0;
 }
 
+// Collapsible TERMINALS / FILES section header: [dot] [LABEL ........] [+].
+// Dot + label toggle the section; "+" adds an entry. The host dismisses any
+// inline rename in its handlers (click-away rule).
+export component SidebarSectionHeader inherits HorizontalLayout {
+    in property <string> label;
+    // TERMINALS: Theme.accent · FILES: Theme.include.
+    in property <color> dot-color: Theme.text-muted;
+    in property <bool> expanded: true;
+    callback toggled();
+    callback add-clicked();
+
+    spacing: 4px;
+    height: 24px;
+    padding-left: 8px;
+    padding-right: 12px;
+
+    TouchArea {
+        width: 20px;
+        height: 24px;
+        mouse-cursor: pointer;
+        clicked => { root.toggled(); }
+        // Colored disc — never Unicode ● / ▾ (Noto Sans tofu).
+        SectionDot {
+            x: (parent.width - self.width) / 2;
+            y: (parent.height - self.height) / 2;
+            fill-color: root.dot-color;
+            expanded: root.expanded;
+        }
+    }
+
+    TouchArea {
+        height: 24px;
+        horizontal-stretch: 1;
+        mouse-cursor: pointer;
+        clicked => { root.toggled(); }
+        Text {
+            width: 100%;
+            height: 100%;
+            text: root.label;
+            color: Theme.text-muted;
+            font-size: 11px;
+            font-weight: 700;
+            vertical-alignment: center;
+        }
+    }
+
+    TouchArea {
+        width: 24px;
+        height: 24px;
+        mouse-cursor: pointer;
+        clicked => { root.add-clicked(); }
+
+        Rectangle {
+            width: 100%;
+            height: 100%;
+            border-radius: 4px;
+            background: parent.has-hover ? Theme.bg-input : transparent;
+
+            Text {
+                width: 100%;
+                height: 100%;
+                text: "+";
+                color: Theme.text-primary;
+                font-size: 16px;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
 // Root is TouchArea (like TabChip) so double-clicked can start rename without
 // destroying the gesture target mid-Released (a child `if !renaming: TouchArea`
 // was torn down inside double-clicked and the rename UI never stuck).
@@ -795,7 +898,8 @@ export component TerminalRow inherits TouchArea {
     callback reorder-drag-move(abs-y: length);
     callback reorder-drag-end();
 
-    height: 44px;
+    // Row pitch (height + list gap) drives app.slint's drag-drop hit math.
+    height: Theme.terminal-row-height;
     mouse-cursor: pointer;
     opacity: root.dim-as-drag-source ? 0.45 : 1.0;
 
@@ -803,26 +907,18 @@ export component TerminalRow inherits TouchArea {
     property <float> press-x: 0;
     property <float> press-y: 0;
     property <bool> reorder-dragging: false;
+    // One-shot commit/cancel guard, shared with the InlineRenameInput child.
     property <bool> rename-closing: false;
-    // Ignore blur until TextInput has focused once (init focus can race has-focus).
-    property <bool> rename-had-focus: false;
     // double_clicked runs before pointer Up — skip activated on that Up.
     property <bool> skip-next-activated: false;
 
+    // Click on row chrome outside the field: same guard as InlineRenameInput.
     function finish-rename-accept(text: string) {
         if (root.rename-closing || !root.renaming) {
             return;
         }
         root.rename-closing = true;
         root.rename-accepted(text);
-    }
-
-    function finish-rename-cancel() {
-        if (root.rename-closing || !root.renaming) {
-            return;
-        }
-        root.rename-closing = true;
-        root.rename-cancelled();
     }
 
     scroll-event(event) => {
@@ -951,7 +1047,7 @@ export component TerminalRow inherits TouchArea {
             }
         }
 
-            title-slot := Rectangle {
+        title-slot := Rectangle {
             horizontal-stretch: 1;
             min-width: 0px;
             vertical-stretch: 1;
@@ -988,51 +1084,18 @@ export component TerminalRow inherits TouchArea {
                         vertical-alignment: center;
                     }
 
-                    if root.renaming: TextInput {
+                    if root.renaming: InlineRenameInput {
                         x: Theme.rename-pad;
                         y: Theme.rename-pad;
                         width: parent.width - 2 * Theme.rename-pad;
                         height: parent.height - 2 * Theme.rename-pad;
-                        min-width: 1px;
-                        font-size: 12px;
-                        color: Theme.rename-text;
-                        horizontal-alignment: left;
                         vertical-alignment: center;
-                            selection-background-color: Theme.selection-bg;
-                            selection-foreground-color: Theme.selection-fg;
-                            single-line: true;
-                            edited => {
-                                root.rename-edited(self.text);
-                            }
-
-                            init => {
-                                root.rename-closing = false;
-                                root.rename-had-focus = false;
-                                self.text = root.rename-text;
-                                self.focus();
-                                self.select-all();
-                            }
-
-                            accepted => {
-                                root.finish-rename-accept(self.text);
-                            }
-
-                            changed has-focus => {
-                                if (self.has-focus) {
-                                    root.rename-had-focus = true;
-                                } else if (root.rename-had-focus && root.renaming && !root.rename-closing) {
-                                    root.finish-rename-accept(self.text);
-                                }
-                            }
-
-                            key-pressed(event) => {
-                                if (event.text == Key.Escape) {
-                                    root.finish-rename-cancel();
-                                    accept
-                                } else {
-                                    reject
-                                }
-                            }
+                        renaming: root.renaming;
+                        draft: root.rename-text;
+                        closing <=> root.rename-closing;
+                        draft-edited(text) => { root.rename-edited(text); }
+                        commit(text) => { root.rename-accepted(text); }
+                        cancel => { root.rename-cancelled(); }
                     }
                 }
 
@@ -1114,6 +1177,8 @@ export component EngineScrollBar inherits Rectangle {
     in property <float> page-size: 1.0;
     in property <bool> enabled: true;
     callback scrolled(value: float);
+    /// True while the user is dragging the thumb (pointer down on track/thumb).
+    callback drag-active(active: bool);
     // Fired on left-button press (track or thumb) so hosts can dismiss inline
     // rename — "any pointer-down outside the field ends rename".
     callback press();
@@ -1167,6 +1232,7 @@ export component EngineScrollBar inherits Rectangle {
             }
             if (event.button == PointerEventButton.left && event.kind == PointerEventKind.down) {
                 root.press();
+                root.drag-active(true);
                 self.press-value = root.value;
                 self.press-mouse = root.horizontal ? self.mouse-x / 1px : self.mouse-y / 1px;
                 self.dragging = true;
@@ -1182,6 +1248,9 @@ export component EngineScrollBar inherits Rectangle {
                     self.press-value = root.value;
                 }
             } else if (event.kind == PointerEventKind.up || event.kind == PointerEventKind.cancel) {
+                if (self.dragging) {
+                    root.drag-active(false);
+                }
                 self.dragging = false;
             }
         }

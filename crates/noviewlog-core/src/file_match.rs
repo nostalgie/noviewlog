@@ -139,18 +139,22 @@ pub fn read_line_at(file: &mut File, offset: u64) -> Result<String, String> {
     let mut raw = Vec::new();
     match read_line_bounded(&mut reader, &mut raw) {
         Ok((0, _)) => Ok(String::new()),
-        Ok((_, truncated)) => {
-            let mut decoded = decode_lossy_line(&raw);
-            if truncated {
-                decoded.push_str(LINE_TRUNCATION_MARKER);
-            }
-            if offset == 0 {
-                Ok(strip_bom(&decoded).into())
-            } else {
-                Ok(decoded)
-            }
-        }
+        Ok((_, truncated)) => Ok(decode_window_line(&raw, truncated, offset)),
         Err(err) => Err(format!("Read error: {err}")),
+    }
+}
+
+/// Decode one raw line for the window/match readers: BOM strip on line 0 and
+/// the truncation marker shared by both.
+fn decode_window_line(raw: &[u8], truncated: bool, offset: u64) -> String {
+    let mut decoded = decode_lossy_line(raw);
+    if truncated {
+        decoded.push_str(LINE_TRUNCATION_MARKER);
+    }
+    if offset == 0 {
+        strip_bom(&decoded).into()
+    } else {
+        decoded
     }
 }
 
@@ -166,8 +170,27 @@ pub fn read_match_window(
     }
     let end = (start + count).min(offsets.len());
     let mut out = Vec::with_capacity(end - start);
+    // Offsets are sorted, so the reads are sequential: one small BufReader
+    // is reused across the window, seeking only when the next offset is not
+    // exactly where the reader sits (issue #332 — a fresh 8 KB buffer per
+    // line meant 10k seeks + ~80 MB transient churn per recenter).
+    let mut reader = BufReader::with_capacity(512, &mut *file);
+    let mut cur_pos = u64::MAX;
     for &off in &offsets[start..end] {
-        out.push(read_line_at(file, off)?);
+        if cur_pos != off {
+            reader
+                .seek(SeekFrom::Start(off))
+                .map_err(|e| format!("Seek failed: {e}"))?;
+        }
+        let mut raw = Vec::new();
+        match read_line_bounded(&mut reader, &mut raw) {
+            Ok((0, _)) => out.push(String::new()),
+            Ok((consumed, truncated)) => {
+                cur_pos = off + consumed as u64;
+                out.push(decode_window_line(&raw, truncated, off));
+            }
+            Err(err) => return Err(format!("Read error: {err}")),
+        }
     }
     Ok(out)
 }
@@ -402,5 +425,56 @@ mod stale_tests {
             "stale size must surface a reload message"
         );
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod window_reader_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn match_window_matches_per_line_reader() {
+        // Issue #332: the window reader reuses one small BufReader across
+        // the window (seek only on position mismatch) — its output must be
+        // identical to the per-line API, including the BOM strip on line 0
+        // and lines longer than the reader buffer.
+        let path = std::env::temp_dir().join(format!("noviewlog-window-{}", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "\u{feff}first line").unwrap();
+            writeln!(f, "second line").unwrap();
+            writeln!(f, "{}", "L".repeat(5000)).unwrap();
+            writeln!(f, "fourth").unwrap();
+        }
+        let content = std::fs::read(&path).unwrap();
+        let mut offsets = vec![0u64];
+        for (i, b) in content.iter().enumerate() {
+            if *b == b'\n' {
+                offsets.push(i as u64 + 1);
+            }
+        }
+        offsets.pop();
+
+        let mut file = File::open(&path).unwrap();
+        let expected: Vec<String> = offsets
+            .iter()
+            .map(|&o| read_line_at(&mut file, o).unwrap())
+            .collect();
+
+        let got = read_match_window(&mut file, &offsets, 0, offsets.len()).unwrap();
+        assert_eq!(got, expected, "sequential window must match read_line_at");
+
+        // Out-of-order offsets exercise the seek-on-mismatch path.
+        let unsorted = [offsets[2], offsets[0]];
+        let got = read_match_window(&mut file, &unsorted, 0, 2).unwrap();
+        assert_eq!(got[0], expected[2]);
+        assert_eq!(got[1], expected[0]);
+
+        // Window from the tail (reader created fresh, seeked to the end).
+        let tail = read_match_window(&mut file, &offsets, offsets.len() - 1, 1).unwrap();
+        assert_eq!(tail, vec![expected[offsets.len() - 1].clone()]);
+
+        let _ = std::fs::remove_file(&path);
     }
 }

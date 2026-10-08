@@ -14,27 +14,37 @@ pub enum SessionChoice {
 /// Assemble the ssh argv for a target (design D3): `ssh -t [extra] target`,
 /// `-p <port>` only when `port > 0`. The target is a single argv element —
 /// no shell interpolation anywhere (the engine spawns directly).
-pub fn build_ssh_argv(target: &str, port: u16, extra_args: &str) -> Vec<String> {
+///
+/// Each entry in `extra_args` is one argv element (spaces preserved). Callers
+/// that store a whitespace-separated string (YAML profile field) must split
+/// before calling; CLI `--ssh-arg` values pass through as-is.
+pub fn build_ssh_argv(target: &str, port: u16, extra_args: &[String]) -> Vec<String> {
     let mut argv = vec!["ssh".to_string(), "-t".to_string()];
     if port > 0 {
         argv.push("-p".to_string());
         argv.push(port.to_string());
     }
-    argv.extend(extra_args.split_whitespace().map(str::to_string));
+    argv.extend(extra_args.iter().cloned());
     argv.push(target.to_string());
     argv
 }
 
-/// Same for a saved profile.
+/// Same for a saved profile. Profile `extra_args` is a whitespace-separated
+/// string in YAML — split here so each token is one argv element.
 pub fn argv_for_profile(profile: &SshProfile) -> Vec<String> {
-    build_ssh_argv(&profile.target, profile.port, &profile.extra_args)
+    let extra: Vec<String> = profile
+        .extra_args
+        .split_whitespace()
+        .map(str::to_string)
+        .collect();
+    build_ssh_argv(&profile.target, profile.port, &extra)
 }
 
 /// Same for the `--ssh` CLI flags: `--port <n>` and repeatable
 /// `--ssh-arg <arg>` (each one argv element). Empty defaults keep the
 /// plain `ssh -t <target>` argv.
 pub fn argv_from_cli_flags(target: &str, port: u16, extra_args: &[String]) -> Vec<String> {
-    build_ssh_argv(target, port, &extra_args.join(" "))
+    build_ssh_argv(target, port, extra_args)
 }
 
 /// Verify the system ssh client exists before `Command::Start` (a missing
@@ -53,10 +63,14 @@ pub fn probe_ssh_client() -> Result<(), String> {
 mod tests {
     use super::*;
 
+    fn extra(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
     fn plain_target_gets_t_flag_only() {
         assert_eq!(
-            build_ssh_argv("deploy@example.com", 0, ""),
+            build_ssh_argv("deploy@example.com", 0, &[]),
             vec!["ssh", "-t", "deploy@example.com"]
         );
     }
@@ -64,16 +78,16 @@ mod tests {
     #[test]
     fn port_is_passed_only_when_nonzero() {
         assert_eq!(
-            build_ssh_argv("web01", 2222, ""),
+            build_ssh_argv("web01", 2222, &[]),
             vec!["ssh", "-t", "-p", "2222", "web01"]
         );
-        assert!(!build_ssh_argv("web01", 0, "").contains(&"-p".to_string()));
+        assert!(!build_ssh_argv("web01", 0, &[]).contains(&"-p".to_string()));
     }
 
     #[test]
-    fn extra_args_are_whitespace_split() {
+    fn extra_args_are_one_element_each() {
         assert_eq!(
-            build_ssh_argv("web01", 0, "-J bastion -4"),
+            build_ssh_argv("web01", 0, &extra(&["-J", "bastion", "-4"])),
             vec!["ssh", "-t", "-J", "bastion", "-4", "web01"]
         );
     }
@@ -81,20 +95,27 @@ mod tests {
     #[test]
     fn target_stays_one_argv_element() {
         // IPv6 literal / odd targets must never be split.
-        let argv = build_ssh_argv("user@[2001:db8::1]", 0, "");
+        let argv = build_ssh_argv("user@[2001:db8::1]", 0, &[]);
         assert_eq!(argv.last().unwrap(), "user@[2001:db8::1]");
     }
 
     #[test]
     fn cli_flags_assemble_port_and_repeatable_args() {
-        // `--ssh web01 --port 2222 --ssh-arg -J --ssh-arg bastion -4`
-        let extra: Vec<String> = ["-J", "bastion", "-4"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
+        // `--ssh web01 --port 2222 --ssh-arg -J --ssh-arg bastion --ssh-arg -4`
+        let extra = extra(&["-J", "bastion", "-4"]);
         assert_eq!(
             argv_from_cli_flags("web01", 2222, &extra),
             vec!["ssh", "-t", "-p", "2222", "-J", "bastion", "-4", "web01"]
+        );
+    }
+
+    #[test]
+    fn cli_ssh_arg_with_spaces_stays_one_argv_element() {
+        // `--ssh-arg "-o ProxyCommand=foo bar"` must not be re-split.
+        let extra = extra(&["-o ProxyCommand=foo bar"]);
+        assert_eq!(
+            argv_from_cli_flags("web01", 0, &extra),
+            vec!["ssh", "-t", "-o ProxyCommand=foo bar", "web01"]
         );
     }
 
@@ -117,6 +138,20 @@ mod tests {
         assert_eq!(
             argv_for_profile(&p),
             vec!["ssh", "-t", "-p", "2022", "-A", "deploy@example.com"]
+        );
+    }
+
+    #[test]
+    fn profile_extra_args_are_whitespace_split() {
+        let p = SshProfile {
+            name: "prod".into(),
+            target: "web01".into(),
+            port: 0,
+            extra_args: "-J bastion -4".into(),
+        };
+        assert_eq!(
+            argv_for_profile(&p),
+            vec!["ssh", "-t", "-J", "bastion", "-4", "web01"]
         );
     }
 }

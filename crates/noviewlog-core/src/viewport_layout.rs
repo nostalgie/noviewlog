@@ -416,7 +416,9 @@ fn collect_visible_from_end(
         let rows = wraps.len();
         let visual_start = visual_end.saturating_sub(rows);
         if visual_end > start && visual_start < end {
-            for (local, visual) in wraps.into_iter().enumerate() {
+            // Push this line's wraps in reverse: the final `stack.reverse()`
+            // restores both inter-line and intra-line (visual row) order.
+            for (local, visual) in wraps.into_iter().enumerate().rev() {
                 let abs = visual_start + local;
                 if abs >= start && abs < end {
                     stack.push(visual);
@@ -478,6 +480,13 @@ pub fn max_scroll_x(lines: &[FlatLine], viewport_width: u32, cell_width: u32) ->
     (max_line_px - available).max(0.0)
 }
 
+/// Map a viewport click `(x, y)` to a flat-line [`TextPos`].
+///
+/// **Contract:** `visual_lines` must be the **full-buffer** layout (index =
+/// absolute visual row). The row is
+/// `((scroll_y + y) / row_stride).floor()` — a visible-only slice (as used by
+/// paint/`caret_pixel_pos`) would silently map to the wrong line. Callers that
+/// rebuild the full layout per click/drag (see `scroll_selection`) satisfy this.
 pub fn pos_at_pixel(
     x: f32,
     y: f32,
@@ -565,6 +574,19 @@ pub fn selection_slice_range(
     Some((from - slice_start, to - slice_start))
 }
 
+/// Largest char boundary `<= at` (and `<= s.len()`).
+///
+/// Shared by selection copy and highlight slicing so a mid-character offset
+/// cannot panic one path while the other silently drifts (#342).
+pub(crate) fn floor_char_boundary(s: &str, at: usize) -> usize {
+    let at = at.min(s.len());
+    if s.is_char_boundary(at) {
+        at
+    } else {
+        (0..at).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0)
+    }
+}
+
 pub fn selection_plain_text(flat_lines: &[FlatLine], sel: &TextSelection) -> String {
     if sel.is_empty() {
         return String::new();
@@ -577,19 +599,11 @@ pub fn selection_plain_text(flat_lines: &[FlatLine], sel: &TextSelection) -> Str
     // buffer swap can hold stale offsets landing mid-character, and plain
     // slicing would panic. Internal producers emit boundaries today; this
     // guard keeps the function total.
-    fn floor_boundary(s: &str, at: usize) -> usize {
-        let at = at.min(s.len());
-        if s.is_char_boundary(at) {
-            at
-        } else {
-            (0..at).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0)
-        }
-    }
 
     if start.line_index == end.line_index {
         let line = &flat_lines[start.line_index].raw;
-        let from = floor_boundary(line, start.byte_offset);
-        let to = floor_boundary(line, end.byte_offset).max(from);
+        let from = floor_char_boundary(line, start.byte_offset);
+        let to = floor_char_boundary(line, end.byte_offset).max(from);
         return line[from..to].to_string();
     }
 
@@ -601,10 +615,10 @@ pub fn selection_plain_text(flat_lines: &[FlatLine], sel: &TextSelection) -> Str
         .take(end.line_index - start.line_index + 1)
     {
         if i == start.line_index {
-            let from = floor_boundary(&line.raw, start.byte_offset);
+            let from = floor_char_boundary(&line.raw, start.byte_offset);
             out.push_str(&line.raw[from..]);
         } else if i == end.line_index {
-            let to = floor_boundary(&line.raw, end.byte_offset);
+            let to = floor_char_boundary(&line.raw, end.byte_offset);
             out.push_str(&line.raw[..to]);
         } else {
             out.push_str(&line.raw);
@@ -928,6 +942,29 @@ mod tests {
         assert_eq!(
             count_visual_rows(&[flat_line(&"x".repeat(200))], true, 80, 8),
             build_visual_lines(&[flat_line(&"x".repeat(200))], true, 80, 8).len()
+        );
+    }
+
+    #[test]
+    fn collect_visible_from_end_matches_full_wrap_slice() {
+        // Several lines that each wrap to multiple rows; first_row > 0 near the
+        // bottom so the from-end (Follow) path runs. The slice must match the
+        // forward build_visual_lines order both across and within each line.
+        let lines: Vec<FlatLine> = (0..5)
+            .map(|i| {
+                flat_line(&format!(
+                    "line-{i}-{}",
+                    "abcdefghijklmnopqrstuvwxyz".repeat(3)
+                ))
+            })
+            .collect();
+        let full = build_visual_lines(&lines, true, 80, 8);
+        assert!(full.len() > 6, "expected wrapped rows, got {}", full.len());
+        let total = full.len();
+        let (first_row, max_rows) = (total - 4, 4);
+        assert_eq!(
+            collect_visible_visual_lines(&lines, true, 80, 8, first_row, max_rows),
+            full[first_row..]
         );
     }
 

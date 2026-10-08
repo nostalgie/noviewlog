@@ -169,6 +169,9 @@ pub struct LogView {
     pub match_offsets: Arc<Vec<u64>>,
     /// Next file byte to scan; `None` means scan complete or not required.
     pub match_scan_pos: Option<u64>,
+    /// Last reported whole-file match-scan percent (0..=100) for status throttle.
+    /// Presentational status text must not be parsed back into data (issue #339).
+    pub last_match_scan_pct: u32,
     /// First match ordinal currently materialized in `flat_lines`.
     pub match_window_start: usize,
     /// Bumped whenever the scan inputs change; results from a background scan
@@ -218,6 +221,7 @@ impl LogView {
             overlay_len: 0,
             match_offsets: Arc::new(Vec::new()),
             match_scan_pos: None,
+            last_match_scan_pct: 0,
             match_window_start: 0,
             match_scan_token: 0,
             match_scan_cancel: None,
@@ -290,6 +294,7 @@ impl LogView {
     pub fn invalidate_match_index(&mut self) {
         self.match_offsets = Arc::new(Vec::new());
         self.match_scan_pos = Some(0);
+        self.last_match_scan_pct = 0;
         self.match_window_start = 0;
         self.match_scan_token = self.match_scan_token.wrapping_add(1);
         Self::cancel_match_scan(&mut self.match_scan_cancel);
@@ -301,6 +306,7 @@ impl LogView {
     pub fn clear_match_index(&mut self) {
         self.match_offsets = Arc::new(Vec::new());
         self.match_scan_pos = None;
+        self.last_match_scan_pct = 0;
         self.match_window_start = 0;
         self.match_scan_token = self.match_scan_token.wrapping_add(1);
         Self::cancel_match_scan(&mut self.match_scan_cancel);
@@ -334,6 +340,47 @@ impl LogView {
         }
     }
 
+    /// Reset the incremental-search flag cluster. Full rescan is required after
+    /// any mutation that can change match offsets; drop_pattern also clears a
+    /// compiled pattern (query/options changed).
+    fn invalidate_search(&mut self, drop_pattern: bool) {
+        self.search_dirty = true;
+        self.search_full_rescan = true;
+        self.search_match_scan_end = 0;
+        if drop_pattern {
+            self.search_pattern = None;
+        }
+    }
+
+    /// Compile the current query into search_pattern, or return the cached one.
+    /// On compile error, clears matches and invalidates so the next refresh retries.
+    fn compiled_pattern(&mut self) -> Option<SearchPattern> {
+        if let Some(p) = self.search_pattern.clone() {
+            return Some(p);
+        }
+        match compile_search_pattern(
+            &self.search_query,
+            self.search_regex,
+            self.search_case_sensitive,
+            self.search_whole_word,
+        ) {
+            Ok(p) => {
+                self.search_error = None;
+                self.search_pattern = Some(p.clone());
+                Some(p)
+            }
+            Err(e) => {
+                self.search_error = Some(e);
+                self.search_matches.clear();
+                self.search_pattern = None;
+                self.search_match_index = 0;
+                self.search_full_rescan = true;
+                self.search_match_scan_end = 0;
+                None
+            }
+        }
+    }
+
     pub fn refresh_search(&mut self) -> Option<usize> {
         if self.search_query.is_empty() {
             self.search_matches.clear();
@@ -347,31 +394,7 @@ impl LogView {
             return None;
         }
 
-        let pattern = if let Some(p) = self.search_pattern.clone() {
-            p
-        } else {
-            match compile_search_pattern(
-                &self.search_query,
-                self.search_regex,
-                self.search_case_sensitive,
-                self.search_whole_word,
-            ) {
-                Ok(p) => {
-                    self.search_error = None;
-                    self.search_pattern = Some(p.clone());
-                    p
-                }
-                Err(e) => {
-                    self.search_error = Some(e);
-                    self.search_matches.clear();
-                    self.search_pattern = None;
-                    self.search_match_index = 0;
-                    self.search_match_scan_end = 0;
-                    self.search_full_rescan = true;
-                    return None;
-                }
-            }
-        };
+        let pattern = self.compiled_pattern()?;
 
         if self.search_full_rescan {
             self.search_matches = collect_search_matches(&self.flat_lines, &pattern);
@@ -434,9 +457,7 @@ impl LogView {
             self.flat_lines_record_cursor = buffer.records_len();
             self.flat_lines_dirty = false;
             self.overlay_len = 0;
-            self.search_dirty = true;
-            self.search_full_rescan = true;
-            self.search_match_scan_end = 0;
+            self.invalidate_search(false);
             self.invalidate_visual_row_index();
         } else if self.flat_lines_record_cursor < buffer.records_len() {
             self.strip_live_overlay();
@@ -465,32 +486,8 @@ impl LogView {
     fn refresh_search_with_buffer(&mut self, buffer: &mut RecordBuffer) -> Option<usize> {
         // Auto-expand collapsed Records that match only on hidden lines.
         if !self.search_query.is_empty() {
-            let pattern = if let Some(p) = self.search_pattern.clone() {
-                Some(p)
-            } else {
-                match compile_search_pattern(
-                    &self.search_query,
-                    self.search_regex,
-                    self.search_case_sensitive,
-                    self.search_whole_word,
-                ) {
-                    Ok(p) => {
-                        self.search_error = None;
-                        self.search_pattern = Some(p.clone());
-                        Some(p)
-                    }
-                    Err(e) => {
-                        self.search_error = Some(e);
-                        self.search_matches.clear();
-                        self.search_pattern = None;
-                        self.search_match_index = 0;
-                        self.search_match_scan_end = 0;
-                        self.search_full_rescan = true;
-                        return None;
-                    }
-                }
-            };
-            if let Some(pattern) = pattern {
+            let pattern = self.compiled_pattern()?;
+            {
                 let need = record_ids_needing_expand_for_search(
                     buffer.records(),
                     &self.filter_engine,
@@ -510,8 +507,7 @@ impl LogView {
                     ));
                     self.flat_lines_record_cursor = buffer.records_len();
                     self.overlay_len = 0;
-                    self.search_full_rescan = true;
-                    self.search_match_scan_end = 0;
+                    self.invalidate_search(false);
                     self.invalidate_visual_row_index();
                 }
             }
@@ -521,11 +517,8 @@ impl LogView {
 
     pub fn mark_search_changed(&mut self) {
         self.search_jump_to_last = true;
-        self.search_dirty = true;
         self.search_scroll_pending = true;
-        self.search_full_rescan = true;
-        self.search_match_scan_end = 0;
-        self.search_pattern = None;
+        self.invalidate_search(true);
     }
 
     pub fn is_search_dirty(&self) -> bool {
@@ -555,9 +548,7 @@ impl LogView {
         self.flat_lines_dirty = false;
         self.flat_lines_record_cursor = 0;
         self.invalidate_visual_row_index();
-        self.search_dirty = true;
-        self.search_full_rescan = true;
-        self.search_match_scan_end = 0;
+        self.invalidate_search(false);
     }
 
     /// Ensure the visual-row index matches current flat lines + geometry; return owned snapshot.
@@ -629,9 +620,7 @@ impl LogView {
     pub fn mark_flat_lines_dirty(&mut self) {
         self.flat_lines_dirty = true;
         self.invalidate_visual_row_index();
-        self.search_dirty = true;
-        self.search_full_rescan = true;
-        self.search_match_scan_end = 0;
+        self.invalidate_search(false);
     }
 
     /// Drop the live VT overlay from the end of `flat_lines`.

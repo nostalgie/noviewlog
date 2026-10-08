@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { LineDto } from "../src/protocol";
-import { computeRows, countRows } from "../src/webview/wrap";
+import { computeRows, RowLayout, type VisualRow } from "../src/webview/wrap";
 
 function line(raw: string): LineDto {
   return {
@@ -39,14 +39,6 @@ describe("computeRows", () => {
   });
 });
 
-describe("countRows", () => {
-  it("aggregates without materializing rows", () => {
-    const lines = [line("aaaa"), line(""), line("aaaaaa")];
-    // 1 + 1 (empty line still paints one row) + 2 = 4 visual rows.
-    expect(countRows(lines, 4)).toBe(4);
-    expect(countRows(lines, 0)).toBe(3);
-  });
-});
 
 describe("surrogate pairs", () => {
   it("does not split an astral character across rows", () => {
@@ -61,10 +53,6 @@ describe("surrogate pairs", () => {
     }
   });
 
-  it("countRows agrees with computeRows on surrogate content", () => {
-    const lines = [line("a\ud83d\ude00bbbb")];
-    expect(countRows(lines, 2)).toBe(computeRows(lines, 2).length);
-  });
 });
 
 describe("display cells", () => {
@@ -83,7 +71,7 @@ describe("display cells", () => {
       const text = raw.slice(r.start, r.end);
       expect(text).not.toMatch(/[\ud800-\udbff](?![\udc00-\udfff])/);
     }
-    expect(countRows([line(raw)], 2)).toBe(rows.length);
+    expect(rows.length).toBeGreaterThan(0);
   });
 
   it("zero-width combining marks do not add cells", () => {
@@ -93,9 +81,65 @@ describe("display cells", () => {
     expect(rows[0]).toMatchObject({ start: 0, end: 6 });
   });
 
-  it("countRows matches computeRows for ascii", () => {
-    const lines = [line("aaaa"), line(""), line("aaaaaa")];
-    expect(countRows(lines, 4)).toBe(4);
-    expect(countRows(lines, 0)).toBe(3);
+});
+
+describe("RowLayout", () => {
+  // Issue #322: appends must reuse the prefix rows (object identity) and
+  // always produce rows equal to a full recompute.
+  function updateAll(
+    layouts: LineDto[][],
+    columns: number,
+  ): { rows: VisualRow[]; identities: VisualRow[][] } {
+    const layout = new RowLayout();
+    const identities: VisualRow[][] = [];
+    let rows: VisualRow[] = [];
+    for (const lines of layouts) {
+      rows = layout.update(lines, columns);
+      identities.push([...rows]);
+    }
+    return { rows, identities };
+  }
+
+  it("append reuses prefix rows and equals a full recompute", () => {
+    // Real append shape (state.ts): same refs for the common prefix, the
+    // previously-last line arrives as a NEW dto when it grew.
+    const base = [line("aaaa"), line("bb")];
+    const grown = [base[0]!, line("bbcc"), line("dd")];
+    const appended = [...grown, line("ee")];
+    const { rows, identities } = updateAll([base, grown, appended], 3);
+    const last = identities[identities.length - 1]!;
+    expect(rows).toEqual(computeRows(appended, 3));
+    // A pure append keeps the untouched lines' row objects (identity).
+    expect(last[0]).toBe(identities[1]![0]);
+    expect(last[1]).toBe(identities[1]![1]);
+    // The grown-last step (p = k-1) still equals a full recompute.
+    expect(identities[1]).toEqual(computeRows(grown, 3));
+  });
+
+  it("column change recomputes fully", () => {
+    const base = [line("aaaa"), line("bb")];
+    const layout = new RowLayout();
+    layout.update(base, 4);
+    const rows = layout.update(base, 2);
+    expect(rows).toEqual(computeRows(base, 2));
+  });
+
+  it("truncation (overlay replace) recomputes fully", () => {
+    const base = [line("aaaa"), line("bb"), line("cc")];
+    const layout = new RowLayout();
+    layout.update(base, 4);
+    const shorter = [base[0]!, line("zz")];
+    const rows = layout.update(shorter, 4);
+    expect(rows).toEqual(computeRows(shorter, 4));
+  });
+
+  it("wrap off: one row per line, appends still equal full recompute", () => {
+    const base = [line("a"), line("b")];
+    const appended = [...base, line("c")];
+    const layout = new RowLayout();
+    layout.update(base, 0);
+    const rows = layout.update(appended, 0);
+    expect(rows).toEqual(computeRows(appended, 0));
+    expect(rows).toHaveLength(3);
   });
 });

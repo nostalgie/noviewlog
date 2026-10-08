@@ -18,7 +18,7 @@ pub(crate) fn parse_launch_args(args_text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Empty UI string field → `None` (engine default), else trimmed ownership.
+/// Empty (after the caller's trim) → `None` (engine default), else owned string.
 fn non_empty(s: &str) -> Option<String> {
     if s.is_empty() {
         None

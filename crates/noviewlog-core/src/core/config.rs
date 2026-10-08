@@ -26,6 +26,21 @@ pub fn load_config_from_yaml(yaml_text: &str) -> AppConfig {
     merge_config_sources(&sources)
 }
 
+/// `load_config_from_yaml` plus an observable parse failure: an explicitly
+/// named config file must not silently fall back to bundled defaults
+/// (issue #321) — callers surface the message like other config problems.
+/// The bundled base is merged in either way, so the config value matches the
+/// unchecked variant exactly.
+pub fn load_config_from_yaml_checked(yaml_text: &str) -> (AppConfig, Option<String>) {
+    match serde_yaml::from_str::<AppConfig>(yaml_text) {
+        Ok(cfg) => (merge_config_sources(&[load_bundled_config(), cfg]), None),
+        Err(err) => (
+            merge_config_sources(&[load_bundled_config()]),
+            Some(format!("config file is corrupt, using defaults: {err}")),
+        ),
+    }
+}
+
 /// Load the user `config.yaml`. On parse failure the corrupt file is preserved
 /// as `config.yaml.corrupt` and a status message is returned instead of
 /// silently resetting to defaults (issue #49). A read failure (transient lock,

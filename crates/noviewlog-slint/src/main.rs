@@ -24,12 +24,13 @@ mod window_chrome;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
-use noviewlog_core::core::types::DEFAULT_MAX_SCROLLBACK_LINES;
+use noviewlog_core::core::types::{DEFAULT_MAX_SCROLLBACK_LINES, DEFAULT_VIEWPORT_FONT_SIZE};
 use noviewlog_core::{Engine, TERMINAL_TAB_NAME};
 use slint::{ComponentHandle, ModelRc, SharedString, Timer, VecModel};
 
 use crate::app_state::ClickTracker;
 use crate::ctx::Ctx;
+use noviewlog_slint::stats_sync::FindQuery;
 use noviewlog_slint::ui::*;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -122,7 +123,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let timer = Rc::new(Timer::default());
     let timer_fast = Rc::new(Cell::new(true));
     let find_debounce = Rc::new(Timer::default());
-    let find_pending = Rc::new(RefCell::new(None::<(String, bool, bool, bool)>));
+    let find_pending = Rc::new(RefCell::new(None::<FindQuery>));
     let filter_draft_debounce = Rc::new(Timer::default());
     let filter_draft_pending = Rc::new(RefCell::new(None::<(String, bool)>));
     // When true, next stats push overwrites find query/toggles (open / tab switch).
@@ -156,6 +157,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let syncing_scroll = Rc::new(Cell::new(false));
+    let scrollbar_drag_active = Rc::new(Cell::new(false));
     let syncing_follow = Rc::new(Cell::new(false));
     let has_selection = Rc::new(Cell::new(false));
     let pty_running = Rc::new(Cell::new(true));
@@ -176,7 +178,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ui.set_renaming_tab_index(-1);
     ui.set_renaming_terminal_id(SharedString::default());
     ui.set_rename_draft(SharedString::default());
-    let viewport_font_size = Rc::new(Cell::new(13.0_f32));
+    let viewport_font_size = Rc::new(Cell::new(DEFAULT_VIEWPORT_FONT_SIZE));
 
     let ctx = Ctx::new(
         engine.clone(),
@@ -196,7 +198,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     viewport::install_zoom(&ui, &ctx, viewport_font_size.clone());
     viewport::install_wrap(&ui, &ctx);
     viewport::install_follow(&ui, &ctx, syncing_follow.clone());
-    viewport::install_scroll(&ui, &ctx, syncing_scroll.clone());
+    viewport::install_scroll(
+        &ui,
+        &ctx,
+        syncing_scroll.clone(),
+        scrollbar_drag_active.clone(),
+    );
     input::install_pointer(
         &ui,
         &ctx,
@@ -261,6 +268,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         was_occluded: was_occluded.clone(),
         viewport_presented: viewport_presented.clone(),
         syncing_scroll: syncing_scroll.clone(),
+        scrollbar_drag_active: scrollbar_drag_active.clone(),
         syncing_follow: syncing_follow.clone(),
         has_selection: has_selection.clone(),
         pty_running: pty_running.clone(),

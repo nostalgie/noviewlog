@@ -66,6 +66,10 @@ Grab a build for your platform from the
 [Releases](../../releases) page:
 
 - **Windows** — unzip and run `NoViewLog.exe` (no installation required)
+  Release binaries are not Authenticode-signed yet; Windows SmartScreen may warn
+  the first time you run after downloading from GitHub. Click **More info**, then
+  **Run anyway**, or unblock the `.zip` in File Explorer (**Properties** →
+  **Unblock**) before extracting.
 - **Linux (.deb)** — install with `sudo apt install ./noviewlog-linux-x64.deb`
   (ships the GUI app with a desktop entry and menu icon)
 - **Linux (archive)** — extract the archive and run the binary

@@ -55,8 +55,10 @@ fn build_row(buf: &mut Vec<u8>, y: u16, paint: impl FnOnce(&mut Vec<u8>)) {
     );
 }
 
-/// Append segments; chars within `hl` (start..end col) get the selection
-/// background. Chars are printed in runs of the same style.
+/// Append segments; cells within `hl` (start..end display-cell columns) get
+/// the selection background. Foreground color and glyph are emitted per
+/// char; the only run-based state is the selection background, which is
+/// reset once when the row leaves the selected span.
 fn queue_segments(
     buf: &mut Vec<u8>,
     segments: &[TextSegment],
@@ -76,7 +78,8 @@ fn queue_segments(
             if col >= cols {
                 break;
             }
-            let selected = hl.is_some_and(|(s, e)| col >= s && col < e);
+            // End-inclusive: matches `text_in_cells` / clipboard (#350).
+            let selected = hl.is_some_and(|(s, e)| col >= s && col <= e);
             let fg = match &seg.style {
                 Some(style) => style.fg.map(rgb).unwrap_or(Color::Reset),
                 None => Color::Reset,
@@ -108,6 +111,46 @@ fn queue_segments(
     let _ = queue!(buf, SetBackgroundColor(Color::Reset));
 }
 
+/// Paint a bordered overlay box with its top-left corner at (`col`, `row`):
+/// `+---+` top border, then `body_lines` rows (`paint_line(buf, i)` is
+/// called with the cursor already at `row + i + 1`), then the bottom border
+/// at `row + body_lines + 1`. `width` is the inner width, so the borders are
+/// `width + 2` cells wide.
+///
+/// Mouse hit-tests (`menu_hit`, `App::connect_click`) invert exactly this
+/// row mapping and clamp the width via `App::menu_width` /
+/// `App::connect_box_width` — change them together. Leaves White-on-DarkBlue
+/// active; the caller resets the background when done.
+fn queue_box(
+    buf: &mut Vec<u8>,
+    col: u16,
+    row: u16,
+    width: usize,
+    body_lines: usize,
+    mut paint_line: impl FnMut(&mut Vec<u8>, usize),
+) {
+    let edge = format!("+{:-<width$}+", "");
+    let _ = queue!(
+        buf,
+        SetForegroundColor(Color::White),
+        SetBackgroundColor(Color::DarkBlue),
+        MoveTo(col, row),
+        Print(&edge)
+    );
+    for i in 0..body_lines {
+        let _ = queue!(buf, MoveTo(col, row + i as u16 + 1));
+        paint_line(buf, i);
+    }
+    let _ = queue!(buf, MoveTo(col, row + body_lines as u16 + 1), Print(edge));
+}
+
+/// One left-aligned body line of a [`queue_box`]: `| text<pad> |`. The text
+/// must already be truncated to the box — `{:<width$}` pads but never
+/// shortens.
+fn queue_box_line(buf: &mut Vec<u8>, width: usize, text: &str) {
+    let _ = queue!(buf, Print(format!("| {text:<width$} |")));
+}
+
 /// Display-cell width of a label: the emulator advances the cursor in cells,
 /// so hit spans must count the same cells the paint cursor moved (wide CJK
 /// chars take two cells), not `chars().count()` (#241).
@@ -130,6 +173,7 @@ fn tab_add_span(x: u16, cols: u16) -> Option<(u16, u16)> {
 }
 
 /// Selection column span for content row `i`, from the drag state.
+/// Both ends are inclusive (same contract as `text_in_cells` / clipboard copy).
 fn highlight_span(app: &App, i: usize) -> Option<(usize, usize)> {
     let a = app.sel_anchor?;
     let c = app.sel_current?;
@@ -341,32 +385,24 @@ pub fn frame(
     }
     app.frame_prev = rows;
 
-    // Context menu overlay (drawn last, on top).
+    // Context menu overlay (drawn last, on top). Item `i` is painted at
+    // `menu.row + i + 1` — the row mapping `menu_hit` inverts for clicks.
     if let Some(menu) = &app.menu {
         let width = usize::from(crate::App::menu_width(menu.col, app.cols.max(1)));
         let mut buf = Vec::new();
-        let _ = queue!(
-            buf,
-            SetForegroundColor(Color::White),
-            SetBackgroundColor(Color::DarkBlue)
-        );
-        let top: String = format!("+{:-<width$}+", "");
-        let _ = queue!(buf, MoveTo(menu.col, menu.row), Print(top));
-        for (idx, item) in menu.items.iter().enumerate() {
-            // Truncate before the fill format: `{:<width$}` never shortens,
-            // so an over-long item would expand past the box (#241).
-            let line = format!("| {:<width$} |", truncate(item, width.saturating_sub(2)));
-            let _ = queue!(
-                buf,
-                MoveTo(menu.col, menu.row + idx as u16 + 1),
-                Print(line)
-            );
-        }
-        let bottom: String = format!("+{:-<width$}+", "");
-        let _ = queue!(
-            buf,
-            MoveTo(menu.col, menu.row + menu.items.len() as u16 + 1),
-            Print(bottom)
+        queue_box(
+            &mut buf,
+            menu.col,
+            menu.row,
+            width,
+            menu.items.len(),
+            |buf, idx| {
+                // Truncate before the fill format: `{:<width$}` never
+                // shortens, so an over-long item would expand past the box
+                // (#241).
+                let text = truncate(menu.items[idx], width.saturating_sub(2));
+                queue_box_line(buf, width, &text);
+            },
         );
         let _ = queue!(buf, SetBackgroundColor(Color::Reset));
         out.write_all(&buf)?;
@@ -379,13 +415,6 @@ pub fn frame(
         let (col, row, count) = app.connect_geo();
         let width = usize::from(crate::App::connect_box_width(col, app.cols.max(1)));
         let mut buf = Vec::new();
-        let _ = queue!(
-            buf,
-            SetForegroundColor(Color::White),
-            SetBackgroundColor(Color::DarkBlue)
-        );
-        let top: String = format!("+{:-<width$}+", "");
-        let _ = queue!(buf, MoveTo(col, row), Print(top));
         let title = if app.profiles.is_empty() {
             " no ssh profiles ".to_string()
         } else {
@@ -394,36 +423,36 @@ pub fn frame(
         // Truncate before the centering fill: `{:^width$}` never shortens,
         // so a title wider than the box would expand past it and wrap (#241).
         let title = truncate(&title, width);
-        let _ = queue!(
-            buf,
-            MoveTo(col, row + 1),
-            Print(format!("|{title:^width$}|"))
-        );
         let sel = app.connect_sel.min(count.saturating_sub(1));
-        for (idx, item) in items.iter().enumerate().take(count) {
+        // Body line 0 is the title (row + 1); item `i` is body line `i + 1`
+        // at `row + i + 2` — the mapping `connect_click` inverts.
+        queue_box(&mut buf, col, row, width, count + 1, |buf, line| {
+            let Some(idx) = line.checked_sub(1) else {
+                let _ = queue!(buf, Print(format!("|{title:^width$}|")));
+                return;
+            };
             // The selected row paints reversed with a `>` marker; the marker
             // replaces a pad space so the box geometry (and mouse hit test)
             // stays identical.
             let selected = idx == sel;
             let marker = if selected { '>' } else { ' ' };
-            let body = format!("{marker}{}", truncate(item, width.saturating_sub(3)));
-            let line = format!("| {:<width$} |", body);
-            let _ = queue!(buf, MoveTo(col, row + idx as u16 + 2));
+            let body = format!("{marker}{}", truncate(&items[idx], width.saturating_sub(3)));
             if selected {
                 let _ = queue!(
                     buf,
                     SetForegroundColor(Color::Black),
-                    SetBackgroundColor(Color::White),
-                    Print(line),
+                    SetBackgroundColor(Color::White)
+                );
+                queue_box_line(buf, width, &body);
+                let _ = queue!(
+                    buf,
                     SetForegroundColor(Color::White),
                     SetBackgroundColor(Color::DarkBlue)
                 );
             } else {
-                let _ = queue!(buf, Print(line));
+                queue_box_line(buf, width, &body);
             }
-        }
-        let bottom: String = format!("+{:-<width$}+", "");
-        let _ = queue!(buf, MoveTo(col, row + count as u16 + 2), Print(bottom));
+        });
         // Empty-profile hint: the actual config path on a line below the box
         // (not interactive — a click there is an outside click, same as Esc).
         if app.profiles.is_empty() {
@@ -499,6 +528,19 @@ mod tests {
         s.chars()
             .map(noviewlog_terminal::terminal::width::char_width)
             .sum()
+    }
+
+    #[test]
+    fn selection_paint_predicate_is_end_inclusive() {
+        // Must stay aligned with `text_in_cells` (`cell >= start && cell <= end`)
+        // so highlight and clipboard cover the same cells (issue #350).
+        let (s, e) = (0usize, 4usize);
+        let painted: Vec<usize> = (0..10).filter(|&col| col >= s && col <= e).collect();
+        assert_eq!(painted, vec![0, 1, 2, 3, 4]);
+        // The old exclusive test (`col < e`) dropped the release cell.
+        let exclusive: Vec<usize> = (0..10).filter(|&col| col >= s && col < e).collect();
+        assert_eq!(exclusive, vec![0, 1, 2, 3]);
+        assert_ne!(painted, exclusive);
     }
 
     #[test]

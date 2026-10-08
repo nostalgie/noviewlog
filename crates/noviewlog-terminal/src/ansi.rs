@@ -229,31 +229,67 @@ pub fn parse_ansi_line(input: &str) -> Vec<TextSegment> {
 /// entirely — letting them degrade to stray codes would e.g. turn `38:2;…`
 /// leftovers into a style-resetting `0`.
 fn sgr_codes(params: &str) -> Vec<u32> {
-    fn parse_piece(p: &str) -> Option<u32> {
-        if p.is_empty() {
-            Some(0)
-        } else {
-            p.parse().ok()
-        }
-    }
-
-    let pieces: Vec<&str> = params.split(';').collect();
-    let mut codes = Vec::new();
-    let mut i = 0;
-    while i < pieces.len() {
-        let piece = pieces[i];
-        i += 1;
+    let mut groups: Vec<Vec<u32>> = Vec::new();
+    for piece in params.split(';') {
         if !piece.contains(':') {
-            if let Some(n) = parse_piece(piece) {
-                codes.push(n);
+            if piece.is_empty() {
+                // `""` parses as 0 (kept: `ESC[;31m` resets via the empty code).
+                groups.push(Vec::new());
+            } else {
+                groups.push(
+                    piece
+                        .parse::<u32>()
+                        .map(|n| vec![n])
+                        .unwrap_or(vec![SGR_MALFORMED]),
+                );
             }
             continue;
         }
         let mut parts = piece.split(':');
-        let lead = parts.next().and_then(|p| p.parse().ok());
-        let subs: Vec<u32> = parts.map(|p| p.parse().ok().unwrap_or(0)).collect();
-        let Some(lead) = lead else { continue };
-        match (lead, subs.as_slice()) {
+        let Some(lead) = parts.next().and_then(|p| p.parse().ok()) else {
+            continue;
+        };
+        let mut group = vec![lead];
+        group.extend(parts.map(|p| p.parse().ok().unwrap_or(0)));
+        groups.push(group);
+    }
+    let refs: Vec<&[u32]> = groups.iter().map(|g| g.as_slice()).collect();
+    sgr_codes_from_groups(&refs)
+}
+
+/// A bare `;`-piece that failed to parse. Skipped on its own; inside a
+/// consume-across group (`38:2` taking its values from following pieces) it
+/// drops the rest, so a parse failure can never leak stray codes.
+pub(crate) const SGR_MALFORMED: u32 = u32::MAX;
+
+/// Expand SGR `;`-pieces into the flat code list of the semicolon-only form.
+/// One slice per piece; colon subparameters are the slice tail — the exact
+/// shape both SGR fronts produce (`sgr_codes` for stored lines, the vte
+/// `Params` front for the live VT grid), so the two stacks share one grammar.
+pub(crate) fn sgr_codes_from_groups(groups: &[&[u32]]) -> Vec<u32> {
+    let val = |g: &[u32]| g.first().copied().unwrap_or(0);
+    let malformed = |g: &[u32]| g.first() == Some(&SGR_MALFORMED);
+
+    let mut codes = Vec::new();
+    let mut i = 0;
+    while i < groups.len() {
+        let group = groups[i];
+        i += 1;
+        if group.is_empty() {
+            codes.push(0);
+            continue;
+        }
+        if malformed(group) {
+            continue;
+        }
+        let lead = group[0];
+        let subs = &group[1..];
+        if subs.is_empty() {
+            // Bare `;`-piece: the code stands on its own.
+            codes.push(lead);
+            continue;
+        }
+        match (lead, subs) {
             (4, [0]) => codes.push(24),
             (4, [n]) if *n > 0 => codes.push(4),
             (c @ (38 | 48), [5, idx]) => codes.extend([c, 5, *idx]),
@@ -261,33 +297,26 @@ fn sgr_codes(params: &str) -> Vec<u32> {
             // `38:2;r;g;b` / `38:5;idx` — color kind in the colon group, the
             // values in the following `;`-separated pieces.
             (c @ (38 | 48), [2]) => {
-                if i + 3 <= pieces.len() {
-                    if let (Some(r), Some(g), Some(b)) = (
-                        parse_piece(pieces[i]),
-                        parse_piece(pieces[i + 1]),
-                        parse_piece(pieces[i + 2]),
-                    ) {
-                        codes.extend([c, 2, r, g, b]);
-                        i += 3;
-                    } else {
-                        // Malformed values: drop the rest of the group.
-                        i = pieces.len();
-                    }
+                if i + 3 <= groups.len()
+                    && !malformed(groups[i])
+                    && !malformed(groups[i + 1])
+                    && !malformed(groups[i + 2])
+                {
+                    codes.extend([c, 2, val(groups[i]), val(groups[i + 1]), val(groups[i + 2])]);
+                    i += 3;
                 } else {
-                    // Truncated group (`38:2;0;0`): the remaining `;`-pieces
-                    // belong to it — consume-and-drop so e.g. a standalone
-                    // `0` cannot leak in as a style reset.
-                    i = pieces.len();
+                    // Malformed or truncated values: drop the rest of the
+                    // group so e.g. a standalone `0` cannot leak in as a
+                    // style reset.
+                    i = groups.len();
                 }
             }
             (c @ (38 | 48), [5]) => {
-                if let Some(&piece) = pieces.get(i) {
-                    if let Some(idx) = parse_piece(piece) {
-                        codes.extend([c, 5, idx]);
-                        i += 1;
-                    } else {
-                        i = pieces.len();
-                    }
+                if i < groups.len() && !malformed(groups[i]) {
+                    codes.extend([c, 5, val(groups[i])]);
+                    i += 1;
+                } else if i < groups.len() {
+                    i = groups.len();
                 }
             }
             // Unsupported colon form (e.g. `58:...`). Color-lead groups
@@ -297,13 +326,13 @@ fn sgr_codes(params: &str) -> Vec<u32> {
             // group (`58:5:9`) owns only its own piece; trailing `;`-pieces
             // are independent parameters and must survive.
             _ => {
-                let needed = match subs.as_slice() {
+                let needed = match subs {
                     [2] => 3,
                     [2, ..] => 3 - (subs.len() - 2).min(3),
                     [5] => 1,
                     _ => 0,
                 };
-                i = (i + needed).min(pieces.len());
+                i = (i + needed).min(groups.len());
             }
         }
     }

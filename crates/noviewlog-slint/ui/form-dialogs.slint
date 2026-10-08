@@ -127,11 +127,6 @@ export component FormTextField inherits VerticalLayout {
             }
         }
     }
-
-    public function focus-field() {
-        field-edit.focus();
-        field-edit.select-all();
-    }
 }
 
 /// Labeled checkbox: Theme square + Path check (no fluent CheckBox, no Unicode glyphs).
@@ -189,8 +184,34 @@ export component FormCheckField inherits HorizontalLayout {
     }
 }
 
+/// Dialog frame recipe (fill, square Theme border, shadow) shared by
+/// `FormDialogPanel` and `ProjectsDialog` so chrome tweaks land in one place.
+export component DialogFrame inherits Rectangle {
+    background: Theme.bg-window;
+    border-width: 1px;
+    border-color: Theme.border;
+    border-radius: 0px;
+    drop-shadow-color: Theme.shadow-panel;
+    drop-shadow-offset-y: 8px;
+    drop-shadow-blur: 20px;
+}
+
+/// Dialog heading (14px bold).
+export component DialogTitle inherits Text {
+    color: Theme.text-primary;
+    font-size: 14px;
+    font-weight: 700;
+}
+
+/// Dialog button row; callers set `alignment` when it is not end-aligned.
+export component DialogFooter inherits HorizontalLayout {
+    spacing: 8px;
+    alignment: end;
+    padding-top: 4px;
+}
+
 /// Titled panel with body `@children` and Cancel / primary footer.
-export component FormDialogPanel inherits Rectangle {
+export component FormDialogPanel inherits DialogFrame {
     in property <string> title: "";
     in property <string> cancel-text: "Cancel";
     in property <string> ok-text: "OK";
@@ -198,7 +219,7 @@ export component FormDialogPanel inherits Rectangle {
     in property <bool> show-cancel: true;
     /// Windows Terminal-style footer: accent button on the left, Cancel right.
     in property <bool> footer-start: false;
-    in property <length> panel-min-width: 420px;
+    in property <length> panel-min-width: Theme.dialog-min-width;
     callback cancelled();
     callback confirmed();
 
@@ -208,14 +229,6 @@ export component FormDialogPanel inherits Rectangle {
         // viewport behind the dialog.
         dialog-keys.focus();
     }
-
-    background: Theme.bg-window;
-    border-width: 1px;
-    border-color: Theme.border;
-    border-radius: 0px;
-    drop-shadow-color: Theme.shadow-panel;
-    drop-shadow-offset-y: 8px;
-    drop-shadow-blur: 20px;
 
     // Enter/Escape when focus is not in a text field (Settings SpinBox, About).
     // TextInput.accepted still handles Enter while typing.
@@ -236,27 +249,22 @@ export component FormDialogPanel inherits Rectangle {
         }
 
         VerticalLayout {
-            padding: 20px;
-            spacing: 16px;
+            padding: Theme.dialog-pad;
+            spacing: Theme.dialog-spacing;
             min-width: root.panel-min-width;
 
-            Text {
+            DialogTitle {
                 text: root.title;
-                color: Theme.text-primary;
-                font-size: 14px;
-                font-weight: 700;
             }
 
             VerticalLayout {
-                spacing: 16px;
+                spacing: Theme.dialog-spacing;
                 width: 100%;
                 @children
             }
 
-            HorizontalLayout {
-                spacing: 8px;
+            DialogFooter {
                 alignment: root.footer-start ? LayoutAlignment.start : LayoutAlignment.end;
-                padding-top: 4px;
 
                 if !root.footer-start && root.show-cancel: AppButton {
                     text: root.cancel-text;

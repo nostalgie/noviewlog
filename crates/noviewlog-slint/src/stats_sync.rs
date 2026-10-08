@@ -10,8 +10,14 @@ use slint::{Model, SharedString, Timer, VecModel};
 use crate::launch_preview::{format_launch_preview, LaunchPreview};
 use crate::ui::{AppWindow, FilterInfo, ProjectInfo, TabInfo, TerminalInfo};
 
-/// Pending debounced find `search_set` payload: query, regex, case, whole-word.
-pub type FindPending = Option<(String, bool, bool, bool)>;
+/// Find bar query fields (debounced `SearchSet` payload).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindQuery {
+    pub text: String,
+    pub regex: bool,
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+}
 
 /// Apply one typed stats snapshot to all Slint chrome / models.
 ///
@@ -26,13 +32,14 @@ pub fn apply_stats(
     ui: &AppWindow,
     terminal_tab_active: &Rc<Cell<bool>>,
     syncing_scroll: &Rc<Cell<bool>>,
+    scrollbar_drag_active: &Rc<Cell<bool>>,
     has_selection: &Rc<Cell<bool>>,
     pty_running: &Rc<Cell<bool>>,
     viewport_font_size: &Rc<Cell<f32>>,
     syncing_follow: &Rc<Cell<bool>>,
     find_resync: &Rc<Cell<bool>>,
     find_stats_tab: &Rc<Cell<i32>>,
-    find_pending: &Rc<RefCell<FindPending>>,
+    find_pending: &Rc<RefCell<Option<FindQuery>>>,
     find_debounce: &Rc<Timer>,
 ) -> bool {
     let tabs_changed = apply_stats_to_tabs(stats, tabs, ui, terminal_tab_active);
@@ -46,7 +53,8 @@ pub fn apply_stats(
         find_pending,
         find_debounce,
     );
-    apply_stats_to_scroll(stats, ui, syncing_scroll);
+    apply_stats_to_scroll(stats, ui, syncing_scroll, scrollbar_drag_active);
+    apply_stats_to_status(stats, ui);
     apply_stats_to_selection(stats, has_selection, ui);
     apply_stats_to_running(stats, pty_running);
     apply_stats_to_view_chrome(stats, ui, viewport_font_size, syncing_follow);
@@ -108,7 +116,12 @@ fn apply_stats_to_tabs(
     changed
 }
 
-fn apply_stats_to_scroll(stats: &StatsSnapshot, ui: &AppWindow, syncing: &Rc<Cell<bool>>) {
+fn apply_stats_to_scroll(
+    stats: &StatsSnapshot,
+    ui: &AppWindow,
+    syncing: &Rc<Cell<bool>>,
+    scrollbar_drag_active: &Rc<Cell<bool>>,
+) {
     let scroll_y = stats.scroll_y;
     let max_scroll_y = stats.max_scroll_y;
     let scroll_x = stats.scroll_x;
@@ -124,7 +137,19 @@ fn apply_stats_to_scroll(stats: &StatsSnapshot, ui: &AppWindow, syncing: &Rc<Cel
     // Always refresh extents (thumb size); skip scroll position if unchanged to avoid churn.
     ui.set_max_scroll_y(max_y);
     ui.set_max_scroll_x(max_x);
-    if (ui.get_scroll_y() - next_y).abs() > 0.5 {
+    // While dragging, Slint owns scroll-y; still refresh max so thumb travel stays
+    // consistent with the engine range (#339).
+    if scrollbar_drag_active.get() {
+        syncing.set(false);
+        return;
+    }
+    // File sessions map scroll in device px; keep thumb aligned with engine stats.
+    let scroll_epsilon = if stats.file_total_lines > 0 {
+        0.01
+    } else {
+        0.5
+    };
+    if (ui.get_scroll_y() - next_y).abs() > scroll_epsilon {
         ui.set_scroll_y(next_y);
     }
     if (ui.get_scroll_x() - next_x).abs() > 0.5 {
@@ -134,6 +159,16 @@ fn apply_stats_to_scroll(stats: &StatsSnapshot, ui: &AppWindow, syncing: &Rc<Cel
         ui.set_show_hscroll(show_h);
     }
     syncing.set(false);
+}
+
+fn apply_stats_to_status(stats: &StatsSnapshot, ui: &AppWindow) {
+    let next = stats.status.as_str();
+    if next.is_empty() {
+        return;
+    }
+    if ui.get_status_text().as_str() != next {
+        ui.set_status_text(SharedString::from(next));
+    }
 }
 
 fn apply_stats_to_terminals(
@@ -317,7 +352,7 @@ fn apply_stats_to_find(
     ui: &AppWindow,
     find_resync: &Rc<Cell<bool>>,
     find_stats_tab: &Rc<Cell<i32>>,
-    find_pending: &Rc<RefCell<FindPending>>,
+    find_pending: &Rc<RefCell<Option<FindQuery>>>,
     find_debounce: &Rc<Timer>,
 ) {
     if !ui.get_find_open() {
@@ -361,26 +396,21 @@ fn apply_stats_to_find(
     }
 
     let ui_query = ui.get_find_query();
-    let status_query = if resync && !query.is_empty() {
-        query
-    } else {
-        ui_query.as_str()
-    };
     // Status counter is engine-truth; only show it when it matches the UI query
     // (avoids "No results" flash for text not yet flushed via debounce).
     let counter_applies = !has_pending && ui_query.as_str() == query;
-    let status =
-        if (!error.is_empty() && counter_applies) || status_query.is_empty() || !counter_applies {
-            SharedString::default()
-        } else if counter == "0/0" {
-            SharedString::from("No results")
-        } else if counter.is_empty() {
-            SharedString::default()
-        } else if let Some((cur, total)) = counter.split_once('/') {
-            SharedString::from(format!("{cur} of {total}"))
-        } else {
-            SharedString::from(counter)
-        };
+    let status_shown = counter_applies && error.is_empty() && !query.is_empty();
+    let status = if !status_shown {
+        SharedString::default()
+    } else if counter == "0/0" {
+        SharedString::from("No results")
+    } else if counter.is_empty() {
+        SharedString::default()
+    } else if let Some((cur, total)) = counter.split_once('/') {
+        SharedString::from(format!("{cur} of {total}"))
+    } else {
+        SharedString::from(counter)
+    };
     ui.set_find_status(status);
     if counter_applies {
         ui.set_find_error(SharedString::from(error));
@@ -486,15 +516,12 @@ fn apply_stats_to_view_chrome(
     let tab_count = stats.tab_count as i32;
     let active = stats.active_tab as i32;
     let is_terminal_tab = stats.is_terminal_tab;
-    let can_restore = stats.can_restore_closed_tab;
     let on_terminal_tab = is_terminal_tab || active == 0;
     let can_close = tab_count > 1 && !on_terminal_tab;
     if ui.get_can_close_tab() != can_close {
         ui.set_can_close_tab(can_close);
     }
-    if ui.get_can_restore_tab() != can_restore {
-        ui.set_can_restore_tab(can_restore);
-    }
+    // can_restore_tab is owned by apply_stats_to_tabs (same snapshot).
     // The Terminal tab must not be renamed — mirror Close enablement for Tab → Rename.
     let can_rename = !on_terminal_tab;
     if ui.get_can_rename_tab() != can_rename {
@@ -527,6 +554,7 @@ fn apply_stats_to_view_chrome(
 
 #[cfg(test)]
 mod tests {
+    use noviewlog_core::core::types::DEFAULT_VIEWPORT_FONT_SIZE;
     use noviewlog_core::{parse_engine_event, EngineEvent, StatsProject, StatsTab};
     use slint::platform::software_renderer::{MinimalSoftwareWindow, RepaintBufferType};
     use slint::platform::{Platform, PlatformError, WindowAdapter};
@@ -589,7 +617,7 @@ mod tests {
     struct FindCtx {
         resync: Rc<Cell<bool>>,
         stats_tab: Rc<Cell<i32>>,
-        pending: Rc<RefCell<FindPending>>,
+        pending: Rc<RefCell<Option<FindQuery>>>,
         debounce: Rc<Timer>,
     }
 
@@ -614,6 +642,7 @@ mod tests {
         filters: Rc<VecModel<FilterInfo>>,
         terminal_tab_active: Rc<Cell<bool>>,
         syncing_scroll: Rc<Cell<bool>>,
+        scrollbar_drag_active: Rc<Cell<bool>>,
         has_selection: Rc<Cell<bool>>,
         pty_running: Rc<Cell<bool>>,
         viewport_font_size: Rc<Cell<f32>>,
@@ -632,9 +661,10 @@ mod tests {
                 filters: Rc::new(VecModel::default()),
                 terminal_tab_active: Rc::new(Cell::new(true)),
                 syncing_scroll: Rc::new(Cell::new(false)),
+                scrollbar_drag_active: Rc::new(Cell::new(false)),
                 has_selection: Rc::new(Cell::new(false)),
                 pty_running: Rc::new(Cell::new(false)),
-                viewport_font_size: Rc::new(Cell::new(13.0)),
+                viewport_font_size: Rc::new(Cell::new(DEFAULT_VIEWPORT_FONT_SIZE)),
                 syncing_follow: Rc::new(Cell::new(false)),
                 find: FindCtx::new(),
             }
@@ -652,6 +682,7 @@ mod tests {
             &h.ui,
             &h.terminal_tab_active,
             &h.syncing_scroll,
+            &h.scrollbar_drag_active,
             &h.has_selection,
             &h.pty_running,
             &h.viewport_font_size,
@@ -820,7 +851,12 @@ mod tests {
         h.ui.set_find_query("user".into());
         h.ui.set_find_status("1 of 3".into());
         h.find.resync.set(true);
-        *h.find.pending.borrow_mut() = Some(("typ".into(), false, false, false));
+        *h.find.pending.borrow_mut() = Some(FindQuery {
+            text: "typ".into(),
+            regex: false,
+            case_sensitive: false,
+            whole_word: false,
+        });
 
         let mut s = base_stats();
         s.search_query = "engine".into();
@@ -841,7 +877,12 @@ mod tests {
         s.active_tab = 0;
         apply(&h, &s);
 
-        *h.find.pending.borrow_mut() = Some(("typ".into(), false, false, false));
+        *h.find.pending.borrow_mut() = Some(FindQuery {
+            text: "typ".into(),
+            regex: false,
+            case_sensitive: false,
+            whole_word: false,
+        });
         h.ui.set_find_query("typ".into());
 
         // New tab with an empty engine search: pending dropped, UI cleared.
@@ -869,7 +910,12 @@ mod tests {
         h.ui.set_find_query("typ".into());
         h.ui.set_find_status("stale".into());
         h.find.resync.set(true);
-        *h.find.pending.borrow_mut() = Some(("typ".into(), false, false, false));
+        *h.find.pending.borrow_mut() = Some(FindQuery {
+            text: "typ".into(),
+            regex: false,
+            case_sensitive: false,
+            whole_word: false,
+        });
 
         let mut s = base_stats();
         s.search_regex = true;

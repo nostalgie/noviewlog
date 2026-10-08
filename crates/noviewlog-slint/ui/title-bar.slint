@@ -1,0 +1,616 @@
+// CSD title strip: [logo] [File] [View] [Tab] [Help] .... [Follow] [WRAP] [severity] [min] [max] [close].
+// Owns the in-bar chrome menus (open / hover-switch / dismiss state); AppWindow supplies
+// state via `in` properties and handles actions via callbacks.
+// Native MenuBar is not used — Slint forces it above Window body children.
+
+import { Theme } from "theme.slint";
+import {
+    CaptionButton,
+    TitleBarToggleChip,
+    TitleBarDropdownChip,
+    TitleBarMenuButton,
+    ChromeMenuItem,
+    ChromeMenuSeparator,
+    ChromeMenuPopup,
+    ChromeSubmenu,
+    SeverityMenuItems,
+} from "chrome-menus.slint";
+
+export component TitleBar inherits Rectangle {
+    in property <bool> maximized: false;
+    in property <bool> is-file-session: false;
+    in property <bool> auto-follow: true;
+    in property <bool> wrap-lines: true;
+    // Active Tab/View severity filter (`all`, `error`, `warn`, `info`, `debug`, `unleveled`).
+    in property <string> severity-mode: "all";
+    in property <bool> can-close-tab: false;
+    in property <bool> can-restore-tab: false;
+    in property <bool> can-rename-tab: true;
+
+    // Menubar "armed": any top-level chrome menu is open → hover switches via
+    // menu-bar-pointer-moved (winit), not TouchArea has-hover (blocked by Popup).
+    // Severity is a top-level chrome menu too (close-chrome-menus closes it) —
+    // omit it and hover-switch early-returns while the severity flyout is open (#333).
+    out property <bool> menu-bar-active: file-menu.is-open || view-menu.is-open || tab-menu.is-open || help-menu.is-open || severity-menu.is-open;
+
+    // Click-away: a chrome menu press / action must end any inline rename first.
+    callback dismiss-rename();
+    callback open-log-file();
+    callback reload-file();
+    callback projects-requested();
+    callback settings-requested();
+    callback about-requested();
+    callback exit-requested();
+    callback set-follow(follow: bool);
+    callback set-wrap-lines(wrap: bool);
+    callback set-severity(mode: string);
+    callback records-expand-all();
+    callback records-collapse-all();
+    callback zoom-in();
+    callback zoom-out();
+    callback zoom-reset();
+    callback close-tab-requested();
+    callback restore-tab-requested();
+    callback rename-tab-requested();
+    // Window caption actions (AppWindow owns minimized / maximized / close()).
+    callback minimize-requested();
+    callback maximize-toggled();
+    callback window-close-requested();
+    // Title-strip drag → Rust calls winit::Window::drag_window.
+    // Only the empty stretch between menus and caption buttons invokes this.
+    callback drag-requested();
+
+    // In-panel ChromeSubmenu mutual exclusion per L1 menu (-1 = none).
+    // Lives on TitleBar: PopupWindow properties are not accessible from outside.
+    property <int> file-active-submenu: -1;
+    property <int> view-active-submenu: -1;
+    property <int> tab-active-submenu: -1;
+
+    height: Theme.title-strip;
+    background: Theme.bg-panel;
+
+    pure function severity-chip-label() -> string {
+        if (root.severity-mode == "error") {
+            return "Err";
+        }
+        if (root.severity-mode == "warn") {
+            return "Warn";
+        }
+        if (root.severity-mode == "info") {
+            return "Info";
+        }
+        if (root.severity-mode == "debug") {
+            return "Dbg";
+        }
+        if (root.severity-mode == "unleveled") {
+            return "Plain";
+        }
+        return "All";
+    }
+
+    pure function hit-title-menu-btn(btn-x: length, btn-y: length, btn-w: length, btn-h: length, px: length, py: length) -> bool {
+        px >= btn-x && px < btn-x + btn-w && py >= btn-y && py < btn-y + btn-h
+    }
+
+    // Invoked from Rust (via AppWindow) on CursorMoved while a chrome menu may be open.
+    // Hit-tests the button rects at call time (absolute-position is not reactive).
+    public function menu-bar-pointer-moved(x: float, y: float) {
+        if (!root.menu-bar-active) {
+            return;
+        }
+        let px = x * 1px;
+        let py = y * 1px;
+        let fa = file-btn.absolute-position;
+        if (root.hit-title-menu-btn(fa.x, fa.y, file-btn.width, file-btn.height, px, py)) {
+            if (!file-menu.is-open) {
+                root.open-file-menu();
+            }
+            return;
+        }
+        let va = view-btn.absolute-position;
+        if (root.hit-title-menu-btn(va.x, va.y, view-btn.width, view-btn.height, px, py)) {
+            if (!view-menu.is-open) {
+                root.open-view-menu();
+            }
+            return;
+        }
+        let tba = tab-btn.absolute-position;
+        if (root.hit-title-menu-btn(tba.x, tba.y, tab-btn.width, tab-btn.height, px, py)) {
+            if (!tab-menu.is-open) {
+                root.open-tab-menu();
+            }
+            return;
+        }
+        let ha = help-btn.absolute-position;
+        if (root.hit-title-menu-btn(ha.x, ha.y, help-btn.width, help-btn.height, px, py)) {
+            if (!help-menu.is-open) {
+                root.open-help-menu();
+            }
+        }
+    }
+
+    // PopupWindow blocks press on the title-bar drag TouchArea. Rust calls this (via
+    // AppWindow) on MouseInput while a chrome menu is open; returns true if the press
+    // hit the drag gap (menus closed — same gesture can then start window drag after slop).
+    public function chrome-press(x: float, y: float) -> bool {
+        if (!root.menu-bar-active) {
+            return false;
+        }
+        let px = x * 1px;
+        let py = y * 1px;
+        let a = title-drag.absolute-position;
+        if (!root.hit-title-menu-btn(a.x, a.y, title-drag.width, title-drag.height, px, py)) {
+            return false;
+        }
+        root.close-chrome-menus();
+        return true;
+    }
+
+    public function close-chrome-menus() {
+        // In-panel ChromeSubmenu flyouts close with their L1 PopupWindow.
+        root.dismiss-rename();
+        root.file-active-submenu = -1;
+        root.view-active-submenu = -1;
+        root.tab-active-submenu = -1;
+        file-menu.close();
+        view-menu.close();
+        tab-menu.close();
+        help-menu.close();
+        severity-menu.close();
+    }
+
+    // Open one top-level menu; closes the others (hover switch / click open).
+    function open-file-menu() {
+        root.view-active-submenu = -1;
+        root.tab-active-submenu = -1;
+        view-menu.close();
+        tab-menu.close();
+        help-menu.close();
+        severity-menu.close();
+        root.file-active-submenu = -1;
+        file-menu.show();
+    }
+
+    function open-view-menu() {
+        root.file-active-submenu = -1;
+        root.tab-active-submenu = -1;
+        file-menu.close();
+        tab-menu.close();
+        help-menu.close();
+        severity-menu.close();
+        root.view-active-submenu = -1;
+        view-menu.show();
+    }
+
+    function open-tab-menu() {
+        root.file-active-submenu = -1;
+        root.view-active-submenu = -1;
+        file-menu.close();
+        view-menu.close();
+        help-menu.close();
+        severity-menu.close();
+        root.tab-active-submenu = -1;
+        tab-menu.show();
+    }
+
+    function open-help-menu() {
+        root.file-active-submenu = -1;
+        root.view-active-submenu = -1;
+        root.tab-active-submenu = -1;
+        file-menu.close();
+        view-menu.close();
+        tab-menu.close();
+        severity-menu.close();
+        help-menu.show();
+    }
+
+    function open-severity-menu() {
+        root.file-active-submenu = -1;
+        root.view-active-submenu = -1;
+        root.tab-active-submenu = -1;
+        file-menu.close();
+        view-menu.close();
+        tab-menu.close();
+        help-menu.close();
+        severity-menu.show();
+    }
+
+    // Default stretch alignment (NOT center): center ignores horizontal-stretch
+    // and packs logo/menus/captions into the middle with empty sides.
+    // Layout: [logo+menus stretch:0] [drag gap stretch:1] [captions stretch:0]
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 4px;
+        // File / View / Tab stay tight; logo→File gap is padding-right on the logo.
+        spacing: 2px;
+
+        // Full strip height + VerticalLayout center — same as TitleBarMenuButton.
+        // Bare 16px Image top-packs under HorizontalLayout stretch alignment.
+        VerticalLayout {
+            horizontal-stretch: 0;
+            height: Theme.title-strip;
+            alignment: center;
+            // Match left window edge→logo: padding-left (10) + CSD inset (0/1).
+            // Total logo→File = padding-right + spacing(2).
+            padding-right: root.maximized ? 8px : 9px;
+
+            Image {
+                source: @image-url("assets/icon.png");
+                width: 16px;
+                height: 16px;
+                image-fit: contain;
+            }
+        }
+
+        // File menu — Open log / Projects / Settings / Exit.
+        file-btn := TitleBarMenuButton {
+            horizontal-stretch: 0;
+            label: "File";
+            open: file-menu.is-open;
+            clicked => {
+                if (file-menu.is-open) {
+                    root.close-chrome-menus();
+                } else {
+                    root.open-file-menu();
+                }
+            }
+
+            file-menu := PopupWindow {
+                x: 0px;
+                // Flush under menubar button (square panel via ChromeMenuPopup).
+                y: parent.height + 1px;
+                close-policy: close-on-click-outside;
+
+                ChromeMenuPopup {
+                    ChromeMenuItem {
+                        title: "Open log file…";
+                        activated => {
+                            root.close-chrome-menus();
+                            root.open-log-file();
+                        }
+                    }
+                    if root.is-file-session: ChromeMenuItem {
+                        title: "Reload log";
+                        activated => {
+                            root.close-chrome-menus();
+                            root.reload-file();
+                        }
+                    }
+                    ChromeMenuItem {
+                        title: "Projects…";
+                        activated => {
+                            root.projects-requested();
+                        }
+                    }
+                    ChromeMenuItem {
+                        title: "Settings…";
+                        activated => {
+                            root.settings-requested();
+                        }
+                    }
+                    ChromeMenuSeparator {}
+                    ChromeMenuItem {
+                        title: "Exit";
+                        activated => {
+                            root.close-chrome-menus();
+                            root.exit-requested();
+                        }
+                    }
+                }
+            }
+        }
+
+        // View menu — Follow + wrap modes + Zoom (wired).
+        view-btn := TitleBarMenuButton {
+            horizontal-stretch: 0;
+            label: "View";
+            open: view-menu.is-open;
+            clicked => {
+                if (view-menu.is-open) {
+                    root.close-chrome-menus();
+                } else {
+                    root.open-view-menu();
+                }
+            }
+
+            view-menu := PopupWindow {
+                x: 0px;
+                // Flush under menubar button (square panel via ChromeMenuPopup).
+                y: parent.height + 1px;
+                close-policy: close-on-click-outside;
+
+                ChromeMenuPopup {
+                    // Zoom flyout: 3 items; Severity flyout: 6 items
+                    cascade-open: root.view-active-submenu >= 0;
+                    cascade-panel-height: root.view-active-submenu == 1
+                        ? Theme.menu-flyout-height(6, 0)
+                        : Theme.menu-flyout-height(3, 0);
+                    if !root.is-file-session: ChromeMenuItem {
+                        title: "Follow";
+                        checkable: true;
+                        checked: root.auto-follow;
+                        activated => {
+                            // Follow: auto-scroll to newest lines.
+                            root.set-follow(!root.auto-follow);
+                            root.close-chrome-menus();
+                        }
+                    }
+                    ChromeMenuItem {
+                        title: "Wrap lines";
+                        checkable: true;
+                        checked: root.wrap-lines;
+                        activated => {
+                            // Wrap toggles; Horizontal scroll forces wrap off.
+                            root.set-wrap-lines(!root.wrap-lines);
+                            root.close-chrome-menus();
+                        }
+                    }
+                    ChromeMenuItem {
+                        title: "Horizontal scroll";
+                        checkable: true;
+                        checked: !root.wrap-lines;
+                        activated => {
+                            root.set-wrap-lines(false);
+                            root.close-chrome-menus();
+                        }
+                    }
+                    ChromeMenuSeparator {}
+                    ChromeMenuItem {
+                        title: "Expand all records";
+                        activated => {
+                            root.records-expand-all();
+                            root.close-chrome-menus();
+                        }
+                    }
+                    ChromeMenuItem {
+                        title: "Collapse all records";
+                        activated => {
+                            root.records-collapse-all();
+                            root.close-chrome-menus();
+                        }
+                    }
+                    ChromeMenuSeparator {}
+                    ChromeSubmenu {
+                        title: "Severity";
+                        submenu-id: 1;
+                        item-count: 6;
+                        active-submenu-id <=> root.view-active-submenu;
+
+                        SeverityMenuItems {
+                            severity-mode: root.severity-mode;
+                            selected(mode) => {
+                                root.set-severity(mode);
+                                root.close-chrome-menus();
+                            }
+                        }
+                    }
+                    ChromeSubmenu {
+                        title: "Zoom";
+                        submenu-id: 0;
+                        item-count: 3;
+                        active-submenu-id <=> root.view-active-submenu;
+
+                        ChromeMenuItem {
+                            title: "Zoom In";
+                            activated => {
+                                root.zoom-in();
+                                root.close-chrome-menus();
+                            }
+                        }
+                        ChromeMenuItem {
+                            title: "Zoom Out";
+                            activated => {
+                                root.zoom-out();
+                                root.close-chrome-menus();
+                            }
+                        }
+                        ChromeMenuItem {
+                            title: "Reset Zoom";
+                            activated => {
+                                root.zoom-reset();
+                                root.close-chrome-menus();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Tab menu opener + dropdown (Close / Restore / Rename).
+        tab-btn := TitleBarMenuButton {
+            horizontal-stretch: 0;
+            label: "Tab";
+            open: tab-menu.is-open;
+            clicked => {
+                if (tab-menu.is-open) {
+                    root.close-chrome-menus();
+                } else {
+                    root.open-tab-menu();
+                }
+            }
+
+            tab-menu := PopupWindow {
+                x: 0px;
+                // Flush under menubar button (square panel via ChromeMenuPopup).
+                y: parent.height + 1px;
+                close-policy: close-on-click-outside;
+
+                ChromeMenuPopup {
+                    ChromeMenuItem {
+                        title: "Close tab";
+                        item-enabled: root.can-close-tab;
+                        activated => {
+                            root.close-tab-requested();
+                            root.close-chrome-menus();
+                        }
+                    }
+                    ChromeMenuItem {
+                        title: "Restore closed tab";
+                        item-enabled: root.can-restore-tab;
+                        activated => {
+                            root.restore-tab-requested();
+                            root.close-chrome-menus();
+                        }
+                    }
+                    ChromeMenuItem {
+                        title: "Rename tab…";
+                        item-enabled: root.can-rename-tab;
+                        activated => {
+                            root.close-chrome-menus();
+                            root.rename-tab-requested();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Help menu — About (Slint Royalty-free attribution).
+        help-btn := TitleBarMenuButton {
+            horizontal-stretch: 0;
+            label: "Help";
+            open: help-menu.is-open;
+            clicked => {
+                if (help-menu.is-open) {
+                    root.close-chrome-menus();
+                } else {
+                    root.open-help-menu();
+                }
+            }
+
+            help-menu := PopupWindow {
+                x: 0px;
+                y: parent.height + 1px;
+                close-policy: close-on-click-outside;
+
+                ChromeMenuPopup {
+                    ChromeMenuItem {
+                        title: "About";
+                        activated => {
+                            root.about-requested();
+                        }
+                    }
+                }
+            }
+        }
+
+        // Drag ONLY this stretch gap (not logo, menus, or caption buttons).
+        // Deferred drag after slop so double-click maximize still works.
+        // After winit drag_window(), Rust clears stuck grab via PointerExited
+        // (compositor consumes the real button-up).
+        // While a chrome Popup is open, this TouchArea never sees press — Rust
+        // hit-tests via chrome-press + CursorMoved slop instead.
+        title-drag := TouchArea {
+            horizontal-stretch: 1;
+            mouse-cursor: default;
+            property <bool> drag-started: false;
+
+            pointer-event(event) => {
+                if (event.button == PointerEventButton.left
+                    && event.kind == PointerEventKind.down) {
+                    self.drag-started = false;
+                }
+                // Release after a completed window drag: clear local flag if
+                // Slint does see the up (X11 sometimes still delivers it).
+                if (event.button == PointerEventButton.left
+                    && event.kind == PointerEventKind.up) {
+                    self.drag-started = false;
+                }
+            }
+
+            moved => {
+                if (!self.pressed || self.drag-started) {
+                    return;
+                }
+                if (abs(self.mouse-x - self.pressed-x) < 4px
+                    && abs(self.mouse-y - self.pressed-y) < 4px) {
+                    return;
+                }
+                self.drag-started = true;
+                root.drag-requested();
+            }
+
+            double-clicked => {
+                root.maximize-toggled();
+            }
+        }
+
+        // Follow / WRAP — caption cluster, outside title-drag (no window drag).
+        if !root.is-file-session: TitleBarToggleChip {
+            horizontal-stretch: 0;
+            label: "Follow";
+            active: root.auto-follow;
+            clicked => {
+                root.dismiss-rename();
+                root.set-follow(!root.auto-follow);
+                root.close-chrome-menus();
+            }
+        }
+        TitleBarToggleChip {
+            horizontal-stretch: 0;
+            label: "WRAP";
+            active: root.wrap-lines;
+            clicked => {
+                root.dismiss-rename();
+                root.set-wrap-lines(!root.wrap-lines);
+                root.close-chrome-menus();
+            }
+        }
+        // Severity filter — dropdown (not cycle-on-click). Soft tint when narrowed.
+        TitleBarDropdownChip {
+            horizontal-stretch: 0;
+            label: root.severity-chip-label();
+            active: root.severity-mode != "all";
+            open: severity-menu.is-open;
+            clicked => {
+                if (severity-menu.is-open) {
+                    root.close-chrome-menus();
+                } else {
+                    root.open-severity-menu();
+                }
+            }
+
+            severity-menu := PopupWindow {
+                // Align under the chip; grow left if near caption buttons.
+                x: min(0px, parent.width - self.width);
+                y: parent.height + 1px;
+                close-policy: close-on-click-outside;
+
+                ChromeMenuPopup {
+                    cascade-open: false;
+                    cascade-panel-height: 0px;
+                    SeverityMenuItems {
+                        severity-mode: root.severity-mode;
+                        selected(mode) => {
+                            root.set-severity(mode);
+                            root.close-chrome-menus();
+                        }
+                    }
+                }
+            }
+        }
+
+        CaptionButton {
+            horizontal-stretch: 0;
+            kind: "minimize";
+            clicked => { root.minimize-requested(); }
+        }
+        CaptionButton {
+            horizontal-stretch: 0;
+            kind: root.maximized ? "restore" : "maximize";
+            clicked => { root.maximize-toggled(); }
+        }
+        CaptionButton {
+            horizontal-stretch: 0;
+            kind: "close";
+            clicked => { root.window-close-requested(); }
+        }
+    }
+
+    // Bottom border under the title strip.
+    Rectangle {
+        height: 1px;
+        y: parent.height - 1px;
+        width: 100%;
+        background: Theme.border-subtle;
+    }
+}

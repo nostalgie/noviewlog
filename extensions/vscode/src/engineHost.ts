@@ -11,6 +11,7 @@
 import * as nodePath from "node:path";
 import * as vscode from "vscode";
 import {
+  MAX_INPUT_CHARS,
   type HostToWebview,
   type PresetsMsg,
   type SessionAppendMsg,
@@ -540,7 +541,11 @@ export class EngineHost implements vscode.Disposable {
           engine.tab_add(id);
           break;
         case "input":
-          if (typeof cmd.data === "string" && cmd.data.length > 0 && cmd.data.length <= 4096) {
+          if (
+            typeof cmd.data === "string" &&
+            cmd.data.length > 0 &&
+            cmd.data.length <= MAX_INPUT_CHARS
+          ) {
             // Desktop rule: typing in the terminal re-engages follow.
             engine.set_follow(id, true);
             this.pty?.write(cmd.data);

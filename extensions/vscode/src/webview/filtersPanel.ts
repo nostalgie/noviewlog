@@ -9,7 +9,8 @@
  */
 
 import type { FilterRuleDto, PresetDto, SeverityMode, WebviewToHost } from "../protocol";
-import type { SessionState } from "./state";
+import { button, el, toggleButton } from "./dom";
+import { emptyState, type SessionState } from "./state";
 
 const APPLY_DEBOUNCE_MS = 300;
 const SEVERITY_MODES: SeverityMode[] = ["all", "error", "warn", "info", "debug", "unleveled"];
@@ -17,7 +18,7 @@ const SEVERITY_MODES: SeverityMode[] = ["all", "error", "warn", "info", "debug",
 let ruleIdCounter = 0;
 
 export class FiltersPanel {
-  state: SessionState = { session: null, exitStatus: null };
+  private state: SessionState = emptyState();
   onCommand: ((cmd: WebviewToHost) => void) | null = null;
   /** Panel close button (layout collapse is owned by main.ts). */
   onClose: (() => void) | null = null;
@@ -152,7 +153,9 @@ export class FiltersPanel {
     this.presets = presets;
     this.renderedPresets = null;
     this.renderPresets();
-  }  render(state: SessionState): void {
+  }
+
+  render(state: SessionState): void {
     this.state = state;
     const session = state.session;
     if (!session) {
@@ -587,33 +590,4 @@ export class FiltersPanel {
 
 function cloneRules(rules: FilterRuleDto[]): FilterRuleDto[] {
   return rules.map((r) => ({ ...r }));
-}
-
-function el(tag: string, className: string): HTMLElement {
-  const e = document.createElement(tag);
-  e.className = className;
-  return e;
-}
-
-function button(label: string, titleText: string, onClick: () => void): HTMLButtonElement {
-  const b = document.createElement("button");
-  b.textContent = label;
-  b.title = titleText;
-  b.onclick = onClick;
-  return b;
-}
-
-function toggleButton(
-  label: string,
-  titleText: string,
-  initial: boolean,
-  onChange: (on: boolean) => void,
-): HTMLButtonElement {
-  const b = button(label, titleText, () => {
-    const on = b.getAttribute("aria-pressed") !== "true";
-    b.setAttribute("aria-pressed", String(on));
-    onChange(on);
-  });
-  b.setAttribute("aria-pressed", String(initial));
-  return b;
 }

@@ -13,12 +13,12 @@
 //! freeze classification), types a combined shell command via SendKeys, drags
 //! the real mouse across part of the sentinel via SendInput, and asserts
 //!
-//! (a) the clipboard holds the selected text exactly (end-inclusive quirk:
-//!     k+1 chars), and
+//! (a) the clipboard holds the selected text exactly (end-inclusive: k+1
+//!     chars for a drag that releases on cell k), and
 //! (b) the painted highlight via screen pixel sampling: WT's palette blue
-//!     (SGR 44 → Campbell #0037DA) covers exactly cells [start, start+k)
-//!     and does not stretch toward EOL (the regression fixed in
-//!     `render.rs queue_segments`).
+//!     (SGR 44 → Campbell #0037DA) covers exactly cells [start, start+k]
+//!     (same end-inclusive span as copy; issue #350) and does not stretch
+//!     toward EOL (the regression fixed in `render.rs queue_segments`).
 //!
 //! Geometry anchoring, deliberately WITHOUT UIA text ranges: Windows
 //! Terminal's TextPattern range walking proved unreliable on this host
@@ -565,7 +565,7 @@ fn wt_drag_selects_span_copies_and_paints() {
         eprintln!("Windows only — skipping");
         return;
     }
-    let Some(wt) = find_wt_exe() else {
+    let Some(wt_exe) = find_wt_exe() else {
         eprintln!("wt.exe not found on this host — skipping (needs Windows Terminal)");
         return;
     };
@@ -603,7 +603,7 @@ fn wt_drag_selects_span_copies_and_paints() {
     let baseline = wt_pids();
     // wt.exe is a launcher: it exits as soon as the terminal window process
     // takes over, and the window is torn down by WtCleanup via taskkill.
-    let mut wt_launcher = Command::new(&wt)
+    let mut wt_launcher = Command::new(&wt_exe)
         .args(["-w", "new", "nt", "--title", "nvl-e2e"])
         .arg(exe.display().to_string())
         .spawn()
@@ -676,22 +676,21 @@ fn wt_drag_selects_span_copies_and_paints() {
         .split_whitespace()
         .filter_map(|t| t.parse().ok())
         .collect();
-    let [wl, wt, wr, wb] = win_nums.as_slice() else {
+    let [win_left, win_top, win_right, win_bottom] = win_nums.as_slice() else {
         panic!("unexpected rect output: {rect_line:?}");
     };
     assert!(
-        wr > wl && wb > wt && *wl > -30000 && *wt > -30000,
+        win_right > win_left && win_bottom > win_top && *win_left > -30000 && *win_top > -30000,
         "window rect looks off-screen: {rect_line}"
     );
-    let (wl, wt) = (*wl as f64, *wt as f64);
+    let (win_left, win_top) = (*win_left as f64, *win_top as f64);
 
     // Drag from the center of sentinel cell 0 to the center of cell k — the
-    // same physical gesture the ConPTY suite models: paint covers cells
-    // [0, k), the copied text is end-inclusive ([0, k]). SendInput needs
-    // screen coordinates.
-    let x1 = wl + cy.x as f64 + 0.5 * cw;
-    let x2 = wl + cy.x as f64 + (k as f64 + 0.5) * cw;
-    let drag_y = wt + mid_y as f64;
+    // same physical gesture the ConPTY suite models: paint and copy both
+    // cover cells [0, k] (end-inclusive). SendInput needs screen coordinates.
+    let x1 = win_left + cy.x as f64 + 0.5 * cw;
+    let x2 = win_left + cy.x as f64 + (k as f64 + 0.5) * cw;
+    let drag_y = win_top + mid_y as f64;
     let dragged = run_helper(
         &ps_path,
         &[
@@ -713,7 +712,7 @@ fn wt_drag_selects_span_copies_and_paints() {
     .0;
     assert_eq!(dragged, "DRAGGED");
 
-    // (a) Clipboard: end-inclusive quirk — k+1 chars.
+    // (a) Clipboard: end-inclusive — k+1 chars.
     let expected: String = sentinel.chars().take(k + 1).collect();
     let deadline = Instant::now() + Duration::from_secs(3);
     let mut got = read_clipboard_now();
@@ -772,11 +771,12 @@ fn wt_drag_selects_span_copies_and_paints() {
         *first >= -2 && *first <= (cw + 2.0) as i64,
         "highlight must start at the sentinel start (first blue at band x={first}, cw={cw})"
     );
-    let lo = ((k - 1) as f64 * cw - 3.0) as i64;
-    let hi = (k as f64 * cw + 1.0) as i64;
+    // End cell is k (inclusive): last blue near the right edge of that cell.
+    let lo = (k as f64 * cw - 3.0) as i64;
+    let hi = ((k + 1) as f64 * cw + 1.0) as i64;
     assert!(
         *last >= lo && *last <= hi,
-        "highlight must cover exactly cells [0, {k}): last blue at band x={last}, expected {lo}..{hi} (cw={cw}, png: {})",
+        "highlight must cover exactly cells [0, {k}]: last blue at band x={last}, expected {lo}..{hi} (cw={cw}, png: {})",
         png.display()
     );
 

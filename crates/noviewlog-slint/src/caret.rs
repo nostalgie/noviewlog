@@ -9,6 +9,7 @@ use noviewlog_core::{Command, Engine, CARET_BLINK_PERIOD};
 use slint::{ComponentHandle, Timer, TimerMode};
 
 use crate::ctx::Ctx;
+use crate::engine_bridge::device_size;
 use noviewlog_slint::ui::AppWindow;
 
 /// Sync Slint caret overlay from engine geometry (device px → logical).
@@ -53,11 +54,9 @@ pub(crate) fn arm_terminal_caret(
     ui.invoke_focus_viewport();
     let mut eng = engine.borrow_mut();
     let _ = eng.send_command(Command::SetViewportFocus { focused: true });
-    eng.reset_caret_blink();
     ui.set_caret_blink_on(true);
     let scale = ui.window().scale_factor().max(0.5) as f32;
-    let width = (logical.0 * scale).ceil().max(1.0) as u32;
-    let height = (logical.1 * scale).ceil().max(1.0) as u32;
+    let (width, height) = device_size(logical, scale);
     let _ = sync_terminal_caret(ui, &eng, width, height, scale);
 }
 

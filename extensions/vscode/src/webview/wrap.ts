@@ -5,22 +5,17 @@
  * positions are UTF-16 unit offsets that never split a code point.
  */
 
-import type { LineDto, SegDto } from "../protocol";
+import type { LineDto } from "../protocol";
 
 export interface VisualRow {
   /** Index into the flat-line array. */
   line: number;
-  /** First visual row of the line (for continuation styling). */
+  /** This row's index within its line (0 = first visual row of the line). */
   row: number;
   rowCount: number;
   /** Character slice [start, end) of `raw` painted on this row. */
   start: number;
   end: number;
-}
-
-/** Split a segment list into (char, segment) runs per segment. */
-function segmentCharCount(seg: SegDto): number {
-  return seg.text.length;
 }
 
 /** Terminal-style display width of a code point (rough wcwidth). */
@@ -85,7 +80,11 @@ export function rowCuts(raw: string, columns: number): number[] {
  * Compute visual rows for `lines` at `columns` grid columns.
  * `columns < 1` disables wrapping (one row per line).
  */
-export function computeRows(lines: LineDto[], columns: number): VisualRow[] {
+export function computeRows(
+  lines: LineDto[],
+  columns: number,
+  lineOffset = 0,
+): VisualRow[] {
   const rows: VisualRow[] = [];
   for (let i = 0; i < lines.length; i++) {
     const raw = lines[i]!.raw;
@@ -94,24 +93,65 @@ export function computeRows(lines: LineDto[], columns: number): VisualRow[] {
     // implicitly starts at 0.
     const rowCount = cuts.length;
     for (let r = 0; r < rowCount; r++) {
-      rows.push({ line: i, row: r, rowCount, start: r === 0 ? 0 : cuts[r - 1]!, end: cuts[r]! });
+      rows.push({
+        line: i + lineOffset,
+        row: r,
+        rowCount,
+        start: r === 0 ? 0 : cuts[r - 1]!,
+        end: cuts[r]!,
+      });
     }
   }
   return rows;
 }
 
 /**
- * Total row count without materializing rows (scroll spacer sizing).
+ * Incremental visual-row layout (issue #322): under PTY flood the webview
+ * receives up to ~60 appends per second, so re-running `computeRows` over
+ * the whole buffer per append is O(buffer) churn. When the new line array
+ * keeps the previous references for the common prefix (the append shape:
+ * `[...view.lines]` truncates to `base` and pushes new DTOs), only the
+ * previously-last line — it may have grown — and the appended tail are
+ * recomputed; any other change (resize, wrap toggle, truncation, mid-buffer
+ * replacement) falls back to a full recompute. The produced rows are always
+ * equal to `computeRows(lines, columns)`, and reused prefix rows keep
+ * object identity.
  */
-export function countRows(lines: LineDto[], columns: number): number {
-  let total = 0;
-  for (const line of lines) {
-    total += rowCuts(line.raw, columns).length;
-  }
-  return total;
-}
+export class RowLayout {
+  rows: VisualRow[] = [];
+  private lines: LineDto[] = [];
+  /** Row index where each line of `lines` starts (every line owns >= 1). */
+  private rowStarts: number[] = [];
+  private currentColumns = 0;
 
-/** True if the char index falls inside the segment's text span. */
-export function charInSegment(seg: SegDto, index: number): boolean {
-  return index >= 0 && index < segmentCharCount(seg);
+  update(lines: LineDto[], columns: number): VisualRow[] {
+    const prev = this.lines;
+    const k = prev.length;
+    // Longest common prefix by reference: the append shape from state.ts is
+    // `old[0..base)` (same refs) plus new DTOs, where the previously-last
+    // line arrives as a NEW object when it grew — so p === k - 1 is the
+    // common grown-last-line case, p === k a pure append.
+    let p = 0;
+    const max = Math.min(k, lines.length);
+    while (p < max && prev[p] === lines[p]) {
+      p++;
+    }
+    const canReuse = columns === this.currentColumns && p >= Math.max(1, k - 1) && k > 0;
+    if (canReuse) {
+      const keepRows = this.rowStarts[p - 1]!;
+      const tail = computeRows(lines.slice(p - 1), columns, p - 1);
+      this.rows = this.rows.slice(0, keepRows).concat(tail);
+    } else {
+      this.rows = computeRows(lines, columns);
+    }
+    this.currentColumns = columns;
+    this.lines = lines;
+    this.rowStarts = new Array(lines.length);
+    let r = 0;
+    for (let i = 0; i < lines.length; i++) {
+      this.rowStarts[i] = r;
+      r += this.rows[r]?.rowCount ?? 1;
+    }
+    return this.rows;
+  }
 }

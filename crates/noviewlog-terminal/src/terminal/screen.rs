@@ -60,19 +60,19 @@ impl Pen {
     }
 }
 
-fn color_sgr(c: Color, _fg: bool) -> String {
+fn color_sgr(c: Color, fg: bool) -> String {
     match c {
         // Basic codes already encode fg vs bg (30.. vs 40..).
         Color::Basic(code) => code.to_string(),
         Color::Ext(n) => {
-            if _fg {
+            if fg {
                 format!("38;5;{n}")
             } else {
                 format!("48;5;{n}")
             }
         }
         Color::Rgb(r, g, b) => {
-            if _fg {
+            if fg {
                 format!("38;2;{r};{g};{b}")
             } else {
                 format!("48;2;{r};{g};{b}")
@@ -172,11 +172,9 @@ impl Row {
         }
     }
 
-    /// Serialize to an ANSI string. Trailing blanks are trimmed only when the
-    /// row is a true line end; auto-wrapped rows keep their full width so a
-    /// space that landed on the wrap column is not lost when re-joining.
-    fn serialize(&self) -> String {
-        let last = if self.wrapped {
+    /// Visible content end: full width when wrapped, else past last non-blank.
+    fn content_len(&self) -> usize {
+        if self.wrapped {
             self.cells.len()
         } else {
             self.cells
@@ -184,7 +182,14 @@ impl Row {
                 .rposition(|c| !c.is_blank())
                 .map(|i| i + 1)
                 .unwrap_or(0)
-        };
+        }
+    }
+
+    /// Serialize to an ANSI string. Trailing blanks are trimmed only when the
+    /// row is a true line end; auto-wrapped rows keep their full width so a
+    /// space that landed on the wrap column is not lost when re-joining.
+    fn serialize(&self) -> String {
+        let last = self.content_len();
         let mut out = String::new();
         let mut cur = Pen::default();
         let mut cur_link: Option<Arc<str>> = None;
@@ -259,8 +264,10 @@ fn pen_to_style(pen: &Pen) -> Option<TextStyle> {
     })
 }
 
-fn overlay_id(line: usize) -> u64 {
-    (u64::MAX / 2).wrapping_add(line as u64)
+/// Overlay ids occupy the upper half of `u64` so they cannot collide with
+/// Record ids (monotonic from 1).
+fn overlay_id(index: usize) -> u64 {
+    (u64::MAX / 2).wrapping_add(index as u64)
 }
 
 fn push_overlay_line(out: &mut Vec<FlatLine>, segments: Vec<TextSegment>, raw: String) {
@@ -274,6 +281,16 @@ fn push_overlay_line(out: &mut Vec<FlatLine>, segments: Vec<TextSegment>, raw: S
         collapsed: false,
         hidden_line_count: 0,
     });
+}
+
+/// Pad to the caret line, then drop trailing empty lines beyond it.
+fn trim_lines_keep_caret(lines: &mut Vec<String>, keep_through: usize) {
+    while lines.len() <= keep_through {
+        lines.push(String::new());
+    }
+    while lines.len() > keep_through + 1 && lines.last().map(|s| s.is_empty()).unwrap_or(false) {
+        lines.pop();
+    }
 }
 
 impl TerminalEmulator {
@@ -368,15 +385,7 @@ impl TerminalEmulator {
         let mut cur = String::new();
         let mut cur_pen = Pen::default();
         for row in &self.screen {
-            let last = if row.wrapped {
-                row.cells.len()
-            } else {
-                row.cells
-                    .iter()
-                    .rposition(|c| !c.is_blank())
-                    .map(|i| i + 1)
-                    .unwrap_or(0)
-            };
+            let last = row.content_len();
             for cell in &row.cells[..last] {
                 if cell.cont {
                     continue;
@@ -403,32 +412,18 @@ impl TerminalEmulator {
 
         // Same trailing-trim / cursor-line padding as plain_screen_lines.
         let keep_through = self.screen_cursor().line;
-        while lines.len() <= keep_through {
-            lines.push(String::new());
-        }
-        while lines.len() > keep_through + 1 && lines.last().map(|s| s.is_empty()).unwrap_or(false)
-        {
-            lines.pop();
-        }
+        trim_lines_keep_caret(&mut lines, keep_through);
         lines.join("\r\n").into_bytes()
     }
 
-    /// Like [`Self::screen_lines`], but plain text from cells (no SGR) — used
-    /// when reflowing the live grid on a column resize.
+    /// Test-only plain-text projection of the live grid (no SGR). Resize
+    /// reflow uses [`Self::styled_screen_ansi`] instead (issue #79).
     #[cfg(test)]
     pub(super) fn plain_screen_lines(&self) -> Vec<String> {
         let mut out: Vec<String> = Vec::new();
         let mut acc = String::new();
         for row in &self.screen {
-            let last = if row.wrapped {
-                row.cells.len()
-            } else {
-                row.cells
-                    .iter()
-                    .rposition(|c| !c.is_blank())
-                    .map(|i| i + 1)
-                    .unwrap_or(0)
-            };
+            let last = row.content_len();
             for cell in &row.cells[..last] {
                 if cell.cont {
                     continue;
@@ -443,12 +438,7 @@ impl TerminalEmulator {
             out.push(acc);
         }
         let keep_through = self.screen_cursor().line;
-        while out.len() <= keep_through {
-            out.push(String::new());
-        }
-        while out.len() > keep_through + 1 && out.last().map(|s| s.is_empty()).unwrap_or(false) {
-            out.pop();
-        }
+        trim_lines_keep_caret(&mut out, keep_through);
         out
     }
 
@@ -468,25 +458,12 @@ impl TerminalEmulator {
             out.push(acc);
         }
         let keep_through = self.screen_cursor().line;
-        while out.len() <= keep_through {
-            out.push(String::new());
-        }
-        while out.len() > keep_through + 1 && out.last().map(|s| s.is_empty()).unwrap_or(false) {
-            out.pop();
-        }
+        trim_lines_keep_caret(&mut out, keep_through);
         out
     }
 
     pub(super) fn row_to_segments(row: &Row) -> (Vec<TextSegment>, String) {
-        let last = if row.wrapped {
-            row.cells.len()
-        } else {
-            row.cells
-                .iter()
-                .rposition(|c| !c.is_blank())
-                .map(|i| i + 1)
-                .unwrap_or(0)
-        };
+        let last = row.content_len();
         let mut segments: Vec<TextSegment> = Vec::new();
         let mut raw = String::new();
         let mut cur_pen = Pen::default();
@@ -539,6 +516,46 @@ impl TerminalEmulator {
         )
     }
 
+    /// Line count of [`Self::overlay_flat_lines`] without building the
+    /// projection (issue #331: the caret path calls this per frame). Same
+    /// walk — wrap-join, trailing-trim, pad-to-cursor-row — over the grid
+    /// only; a parity test pins it to the projection.
+    pub fn overlay_line_count(&self) -> usize {
+        let mut count = 0usize;
+        // Per-line emptiness, needed by the trailing-trim below.
+        let mut line_empty: Vec<bool> = Vec::new();
+        let mut cur_empty = true;
+        for row in &self.screen {
+            let last = row.content_len();
+            for cell in &row.cells[..last] {
+                if cell.cont {
+                    continue;
+                }
+                cur_empty = false;
+            }
+            if !row.wrapped {
+                count += 1;
+                line_empty.push(cur_empty);
+                cur_empty = true;
+            }
+        }
+        if count == 0 || !cur_empty {
+            // Pending tail line (cells after the last terminator, or an
+            // all-wrapped grid with no terminated line yet).
+            count += 1;
+            line_empty.push(cur_empty);
+        }
+        let keep_through = self.screen_cursor().line;
+        if count <= keep_through {
+            return keep_through + 1;
+        }
+        while count > keep_through + 1 && line_empty.last() == Some(&true) {
+            count -= 1;
+            line_empty.pop();
+        }
+        count
+    }
+
     /// Live screen as Terminal tab overlay lines (cells → segments, no Records).
     pub fn overlay_flat_lines(&self) -> Vec<FlatLine> {
         let mut out: Vec<FlatLine> = Vec::new();
@@ -558,15 +575,7 @@ impl TerminalEmulator {
         };
 
         for row in &self.screen {
-            let last = if row.wrapped {
-                row.cells.len()
-            } else {
-                row.cells
-                    .iter()
-                    .rposition(|c| !c.is_blank())
-                    .map(|i| i + 1)
-                    .unwrap_or(0)
-            };
+            let last = row.content_len();
             for cell in &row.cells[..last] {
                 if cell.cont {
                     continue;
@@ -842,7 +851,7 @@ impl TerminalEmulator {
         }
     }
 
-    pub(super) fn apply_sgr(&mut self, codes: &[u16]) {
+    pub(super) fn apply_sgr(&mut self, codes: &[u32]) {
         if codes.is_empty() {
             self.pen = Pen::default();
             return;
@@ -861,20 +870,22 @@ impl TerminalEmulator {
                 24 => self.pen.underline = false,
                 39 => self.pen.fg = None,
                 49 => self.pen.bg = None,
-                n @ (30..=37 | 90..=97) => self.pen.fg = Some(Color::Basic(n)),
-                n @ (40..=47 | 100..=107) => self.pen.bg = Some(Color::Basic(n)),
+                n @ (30..=37 | 90..=97) => self.pen.fg = Some(Color::Basic(n as u16)),
+                n @ (40..=47 | 100..=107) => self.pen.bg = Some(Color::Basic(n as u16)),
                 38 | 48 => {
                     let is_fg = codes[i] == 38;
                     let color = match codes.get(i + 1).copied() {
                         Some(5) => {
-                            let n = codes.get(i + 2).copied().unwrap_or(0);
+                            let n = codes.get(i + 2).copied().unwrap_or(0).min(255) as u16;
                             i += 2;
                             Some(Color::Ext(n))
                         }
                         Some(2) => {
-                            let r = codes.get(i + 2).copied().unwrap_or(0) as u8;
-                            let g = codes.get(i + 3).copied().unwrap_or(0) as u8;
-                            let b = codes.get(i + 4).copied().unwrap_or(0) as u8;
+                            // Clamp like the line stack: u32 codes may exceed
+                            // a u8 and `as u8` would wrap, not saturate.
+                            let r = codes.get(i + 2).copied().unwrap_or(0).min(255) as u8;
+                            let g = codes.get(i + 3).copied().unwrap_or(0).min(255) as u8;
+                            let b = codes.get(i + 4).copied().unwrap_or(0).min(255) as u8;
                             i += 4;
                             Some(Color::Rgb(r, g, b))
                         }

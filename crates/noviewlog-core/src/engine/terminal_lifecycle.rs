@@ -21,6 +21,31 @@ fn format_process_exit_message(code: i32) -> String {
     format!("Process exited ({code})")
 }
 
+/// A PTY event after same-terminal byte coalescing.
+enum Coalesced {
+    Bytes {
+        id: String,
+        data: Vec<u8>,
+    },
+    Exit {
+        id: String,
+        code: i32,
+        generation: u64,
+    },
+}
+
+#[derive(Default)]
+struct PtyBytesOutcome {
+    active_changed: bool,
+    chrome_changed: bool,
+}
+
+#[derive(Default)]
+struct PtyExitOutcome {
+    active_changed: bool,
+    respawn_shell_id: Option<String>,
+}
+
 impl Engine {
     fn bump_pty_generation_for(&mut self, terminal_id: &str) -> u64 {
         let Some(term) = self.terminals.iter_mut().find(|t| t.id == terminal_id) else {
@@ -35,18 +60,69 @@ impl Engine {
         // event drain, so fresh PTY output is ingested in the same tick.
         self.advance_pending_spawns();
 
-        enum Coalesced {
-            Bytes {
-                id: String,
-                data: Vec<u8>,
-            },
-            Exit {
-                id: String,
-                code: i32,
-                generation: u64,
-            },
+        let (coalesced, more_pending) = self.drain_pty_events();
+
+        let mut active_changed = false;
+        let mut chrome_changed = false;
+        let mut respawn_shell_ids: Vec<String> = Vec::new();
+        let active_id = self
+            .terminals
+            .get(self.active_terminal)
+            .map(|t| t.id.clone());
+
+        for event in coalesced {
+            match event {
+                Coalesced::Bytes { id, data } => {
+                    let is_active = active_id.as_ref() == Some(&id);
+                    if let Some(outcome) = self.apply_pty_bytes(&id, &data, is_active) {
+                        active_changed |= outcome.active_changed;
+                        chrome_changed |= outcome.chrome_changed;
+                    }
+                }
+                Coalesced::Exit {
+                    id,
+                    code,
+                    generation,
+                } => {
+                    let is_active = active_id.as_ref() == Some(&id);
+                    if let Some(outcome) = self.handle_pty_exit(id, code, generation, is_active) {
+                        chrome_changed = true;
+                        active_changed |= outcome.active_changed;
+                        if let Some(shell_id) = outcome.respawn_shell_id {
+                            respawn_shell_ids.push(shell_id);
+                        }
+                    }
+                }
+            }
         }
 
+        if chrome_changed {
+            self.last_stats_at = None;
+        }
+        if active_changed {
+            // Follow is snapped in apply_active_pty_bytes / snap_follow_scroll_after_ingest
+            // on every chunk. Paint dirty only at display cadence while more PTY work
+            // remains — full paint per 256 KB made cat feel hitchy vs a native terminal.
+            self.mark_viewport_dirty_after_pty_ingest(more_pending);
+        }
+
+        if more_pending {
+            // Host must NOT immediate-retick. TICK_FAST (~33 ms) continues the drain.
+            // Immediate schedule_host_tick + reader wake was a 1-core busy ingest loop.
+            self.pty_drain_pending = true;
+        }
+
+        self.last_pty_poll_at = Some(Instant::now());
+
+        for id in respawn_shell_ids {
+            self.start_interactive_shell_for(&id);
+        }
+        self.flush_idle_pending();
+    }
+
+    /// Drain / coalesce reader events under the ingest byte + wall-clock budget.
+    /// Returns coalesced events and whether more work remains (`pty_hold` / queue).
+    fn drain_pty_events(&mut self) -> (Vec<Coalesced>, bool) {
         let mut coalesced: Vec<Coalesced> = Vec::new();
         // Drain mode (issue #126): when the previous tick held work back, the
         // reader queue is backing up — widen the budget so ingest can outpace
@@ -60,15 +136,13 @@ impl Engine {
         let ingest_started = Instant::now();
         let mut more_pending = false;
 
-        let mut pending_events: Vec<PtyEvent> = Vec::new();
-        if let Some(held) = self.pty_hold.take() {
-            pending_events.push(held);
-        }
+        // 0-or-1 held event from the previous tick (Option in disguise).
+        let mut pending_event = self.pty_hold.take();
         loop {
-            if byte_budget == 0 && pending_events.is_empty() {
+            if byte_budget == 0 && pending_event.is_none() {
                 break;
             }
-            let event = if let Some(ev) = pending_events.pop() {
+            let event = if let Some(ev) = pending_event.take() {
                 ev
             } else if byte_budget == 0 || ingest_started.elapsed() >= PTY_INGEST_TIME_BUDGET {
                 break;
@@ -145,142 +219,116 @@ impl Engine {
         } else {
             more_pending = true;
         }
+        (coalesced, more_pending)
+    }
 
-        let mut active_changed = false;
-        let mut chrome_changed = false;
-        let mut respawn_shell_ids: Vec<String> = Vec::new();
-        let active_id = self
-            .terminals
-            .get(self.active_terminal)
-            .map(|t| t.id.clone());
+    /// Feed a coalesced byte chunk into its terminal and patch views.
+    fn apply_pty_bytes(
+        &mut self,
+        id: &str,
+        data: &[u8],
+        is_active: bool,
+    ) -> Option<PtyBytesOutcome> {
+        let term_idx = self.terminals.iter().position(|t| t.id == id)?;
+        let mut outcome = PtyBytesOutcome::default();
+        let skip_logview_patch = is_active && self.paints_live_vt_grid();
+        let old_overlay = if skip_logview_patch {
+            0
+        } else {
+            self.terminals[term_idx]
+                .views
+                .first()
+                .map(|v| v.overlay_len())
+                .unwrap_or(0)
+        };
+        let old_total = self.terminals[term_idx].buffer.records_len();
 
-        for event in coalesced {
-            match event {
-                Coalesced::Bytes { id, data } => {
-                    let Some(term_idx) = self.terminals.iter().position(|t| t.id == id) else {
-                        continue;
-                    };
-                    let is_active = active_id.as_ref() == Some(&id);
-                    let skip_logview_patch = is_active && self.paints_live_vt_grid();
-                    let old_overlay = if skip_logview_patch {
-                        0
-                    } else {
-                        self.terminals[term_idx]
-                            .views
-                            .first()
-                            .map(|v| v.overlay_len())
-                            .unwrap_or(0)
-                    };
-                    let old_total = self.terminals[term_idx].buffer.records_len();
+        let (shifted_records, shifted_lines) = {
+            let term = &mut self.terminals[term_idx];
+            let (records, lines) = term.ingest.feed(data, &mut term.buffer, &mut term.parser);
+            if let Some(cwd) = term.ingest.take_cwd_update() {
+                term.cwd = cwd;
+                outcome.chrome_changed = true;
+            }
+            term.last_line_at = Some(Instant::now());
+            (records, lines)
+        };
 
-                    let (shifted_records, shifted_lines) = {
-                        let term = &mut self.terminals[term_idx];
-                        let (records, lines) =
-                            term.ingest.feed(&data, &mut term.buffer, &mut term.parser);
-                        if let Some(cwd) = term.ingest.take_cwd_update() {
-                            term.cwd = cwd;
-                            chrome_changed = true;
-                        }
-                        term.last_line_at = Some(Instant::now());
-                        (records, lines)
-                    };
-
-                    if is_active {
-                        active_changed = true;
-                        if skip_logview_patch {
-                            if shifted_lines > 0 {
-                                let terminal = &mut self.terminals[term_idx];
-                                for (i, view) in terminal.views.iter_mut().enumerate() {
-                                    if i != 0 {
-                                        view.mark_flat_lines_dirty();
-                                    }
-                                }
-                            }
-                            self.snap_follow_scroll_after_ingest(term_idx);
-                        } else {
-                            let overlay = self.terminals[term_idx].ingest.overlay_flat_lines();
-                            let new_total = self.terminals[term_idx].buffer.records_len();
-                            self.apply_active_pty_bytes_to_views(
-                                term_idx,
-                                old_overlay,
-                                old_total,
-                                overlay,
-                                new_total,
-                                shifted_records,
-                                shifted_lines,
-                            );
-                            self.snap_follow_scroll_after_ingest(term_idx);
-                        }
-                    } else if shifted_lines > 0 {
-                        for view in &mut self.terminals[term_idx].views {
+        if is_active {
+            outcome.active_changed = true;
+            if skip_logview_patch {
+                if shifted_lines > 0 {
+                    let terminal = &mut self.terminals[term_idx];
+                    for (i, view) in terminal.views.iter_mut().enumerate() {
+                        if i != 0 {
                             view.mark_flat_lines_dirty();
                         }
                     }
                 }
-                Coalesced::Exit {
-                    id,
-                    code,
-                    generation,
-                } => {
-                    if self
-                        .ptys
-                        .get(&id)
-                        .is_some_and(|p| p.generation() != generation)
-                    {
-                        continue;
-                    }
-                    let Some(term) = self.terminals.iter_mut().find(|t| t.id == id) else {
-                        continue;
-                    };
-                    if term.pty_generation != generation {
-                        continue;
-                    }
-                    term.ingest.finish(&mut term.buffer, &mut term.parser);
-                    term.running = false;
-                    term.exit_code = Some(code);
-                    let file_session = term.is_file_session();
-                    let has_launch_command = term.launch.command.is_some();
-                    self.ptys.remove(&id);
-                    let message = format_process_exit_message(code);
-                    chrome_changed = true;
-                    if active_id.as_ref() == Some(&id) {
-                        self.status_message = message.clone();
-                        active_changed = true;
-                        self.mark_all_views_dirty();
-                        self.materialize_live_terminal_tab();
-                        self.mark_viewport_dirty();
-                        self.push_event(json!({"type":"exit","code": code, "message": message}));
-                    }
-                    // Programs with a saved command stay stopped; plain shells respawn.
-                    if !file_session && !has_launch_command {
-                        respawn_shell_ids.push(id);
-                    }
-                }
+                self.snap_follow_scroll_after_ingest(term_idx);
+            } else {
+                let overlay = self.terminals[term_idx].ingest.overlay_flat_lines();
+                let new_total = self.terminals[term_idx].buffer.records_len();
+                self.apply_active_pty_bytes_to_views(
+                    term_idx,
+                    old_overlay,
+                    old_total,
+                    overlay,
+                    new_total,
+                    shifted_records,
+                    shifted_lines,
+                );
+                self.snap_follow_scroll_after_ingest(term_idx);
+            }
+        } else if shifted_lines > 0 {
+            for view in &mut self.terminals[term_idx].views {
+                view.mark_flat_lines_dirty();
             }
         }
+        Some(outcome)
+    }
 
-        if chrome_changed {
-            self.last_stats_at = None;
+    /// Apply a PTY exit. Returns `None` for stale / unknown sessions.
+    /// Chrome always changes when `Some` is returned.
+    fn handle_pty_exit(
+        &mut self,
+        id: String,
+        code: i32,
+        generation: u64,
+        is_active: bool,
+    ) -> Option<PtyExitOutcome> {
+        if self
+            .ptys
+            .get(&id)
+            .is_some_and(|p| p.generation() != generation)
+        {
+            return None;
         }
-        if active_changed {
-            // Follow is snapped in apply_active_pty_bytes / snap_follow_scroll_after_ingest
-            // on every chunk. Paint dirty only at display cadence while more PTY work
-            // remains — full paint per 256 KB made cat feel hitchy vs a native terminal.
-            self.mark_viewport_dirty_after_pty_ingest(more_pending);
+        let term = self.terminals.iter_mut().find(|t| t.id == id)?;
+        if term.pty_generation != generation {
+            return None;
         }
-
-        if more_pending {
-            // Host must NOT immediate-retick. TICK_FAST (~33 ms) continues the drain.
-            // Immediate schedule_host_tick + reader wake was a 1-core busy ingest loop.
-            self.pty_drain_pending = true;
+        term.ingest.finish(&mut term.buffer, &mut term.parser);
+        term.running = false;
+        term.exit_code = Some(code);
+        let file_session = term.is_file_session();
+        let has_launch_command = term.launch.command.is_some();
+        self.ptys.remove(&id);
+        let message = format_process_exit_message(code);
+        let mut outcome = PtyExitOutcome::default();
+        if is_active {
+            self.status_message = message.clone();
+            outcome.active_changed = true;
+            self.mark_all_views_dirty();
+            self.materialize_live_terminal_tab();
+            self.mark_viewport_dirty();
+            self.push_event(json!({"type":"exit","code": code, "message": message}));
         }
-
-        self.last_pty_poll_at = Some(Instant::now());
-
-        for id in respawn_shell_ids {
-            self.start_interactive_shell_for(&id);
+        // Programs with a saved command stay stopped; plain shells respawn.
+        if !file_session && !has_launch_command {
+            outcome.respawn_shell_id = Some(id);
         }
-        self.flush_idle_pending();
+        Some(outcome)
     }
 
     /// Patch Terminal tab flat lines for a volatile VT update.
@@ -426,9 +474,9 @@ impl Engine {
         if term.is_file_session() {
             return;
         }
-        let Some(view) = term.views.first() else {
-            return;
-        };
+        // Follow is per-view: snap only when the ACTIVE view (whose scrollbar
+        // resolves `max_scroll_offset`) is following, not the Terminal tab (#316).
+        let view = term.active_view();
         if !view.auto_follow || !view.search_query.is_empty() {
             return;
         }
@@ -639,7 +687,6 @@ impl Engine {
             self.fail_spawn(term_idx, &id, &pending, &err);
         } else {
             let term = &mut self.terminals[term_idx];
-            term.ingest.ensure_live_screen(&mut term.buffer);
             let buffered = std::mem::take(&mut term.pending_stdin);
             if !buffered.is_empty() {
                 if let Some(pty) = self.ptys.get_mut(&id) {
@@ -708,13 +755,11 @@ impl Engine {
 
     /// Create and activate a terminal without starting a shell (used for file viewers).
     pub(crate) fn terminal_add_blank(&mut self) {
-        let runtime = build_runtime_config(&self.config, Some(&self.preset_name));
         let format = self.current_format();
-        let id = next_terminal_id(&self.terminals);
+        let id = next_terminal_id();
         let terminal = TerminalState::new(
             id,
             LaunchConfig::default(),
-            &runtime,
             &format,
             self.config.max_scrollback_lines,
         );

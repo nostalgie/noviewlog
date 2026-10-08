@@ -6,7 +6,7 @@ use crate::snapshot::{session_append_since, session_snapshot, LineDto, SessionSn
 
 use super::*;
 
-/// A 2-row grid so the first LF commits the top line вЂ” no long preamble
+/// A 2-row grid so the first LF commits the top line — no long preamble
 /// needed before lines reach the Record buffer.
 fn pty_session(id: u32) -> Session {
     pty_session_rows(id, 2)
@@ -25,7 +25,7 @@ fn file_session(id: u32) -> Session {
 fn feed_committed(session: &mut Session, lines: &[&str]) {
     // One chunk per call, like a real PTY read: Record grouping happens
     // within a chunk (each commit boundary flushes parser pending, so a
-    // multiline Record split across chunks would split вЂ” desktop parity).
+    // multiline Record split across chunks would split — desktop parity).
     let mut bytes = Vec::new();
     for line in lines {
         bytes.extend_from_slice(line.as_bytes());

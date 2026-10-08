@@ -1,4 +1,17 @@
-use crate::core::types::{compile_filter, FilterRule, FilterType};
+use crate::core::types::{compile_filter, FilterRule, FilterType, FlatLine};
+
+fn flat(raw: &str) -> FlatLine {
+    FlatLine {
+        record_id: 1,
+        line_index: 0,
+        segments: vec![],
+        raw: raw.to_string(),
+        level: None,
+        collapsible: false,
+        collapsed: false,
+        hidden_line_count: 0,
+    }
+}
 
 #[cfg(unix)]
 #[test]
@@ -252,31 +265,11 @@ fn workspace_config_round_trip_yaml() {
 
 #[test]
 fn search_literal_is_case_insensitive() {
-    use crate::core::types::FlatLine;
     use crate::core::visible::{collect_search_matches, compile_search_pattern};
 
-    let lines = vec![
-        FlatLine {
-            record_id: 1,
-            line_index: 0,
-            segments: vec![],
-            raw: "Error: BOOM".to_string(),
-            level: None,
-            collapsible: false,
-            collapsed: false,
-            hidden_line_count: 0,
-        },
-        FlatLine {
-            record_id: 2,
-            line_index: 0,
-            segments: vec![],
-            raw: "info: ok".to_string(),
-            level: None,
-            collapsible: false,
-            collapsed: false,
-            hidden_line_count: 0,
-        },
-    ];
+    let mut second = flat("info: ok");
+    second.record_id = 2;
+    let lines = vec![flat("Error: BOOM"), second];
     let pattern = compile_search_pattern("boom", false, false, false).unwrap();
     let matches = collect_search_matches(&lines, &pattern);
     assert_eq!(matches.len(), 1);
@@ -286,19 +279,9 @@ fn search_literal_is_case_insensitive() {
 
 #[test]
 fn search_case_sensitive_excludes_mismatched_case() {
-    use crate::core::types::FlatLine;
     use crate::core::visible::{collect_search_matches, compile_search_pattern};
 
-    let lines = vec![FlatLine {
-        record_id: 1,
-        line_index: 0,
-        segments: vec![],
-        raw: "Error: BOOM boom".to_string(),
-        level: None,
-        collapsible: false,
-        collapsed: false,
-        hidden_line_count: 0,
-    }];
+    let lines = vec![flat("Error: BOOM boom")];
     let ci = compile_search_pattern("boom", false, false, false).unwrap();
     let cs = compile_search_pattern("boom", false, true, false).unwrap();
     assert_eq!(collect_search_matches(&lines, &ci).len(), 2);
@@ -309,19 +292,9 @@ fn search_case_sensitive_excludes_mismatched_case() {
 
 #[test]
 fn search_whole_word_excludes_substrings() {
-    use crate::core::types::FlatLine;
     use crate::core::visible::{collect_search_matches, compile_search_pattern};
 
-    let lines = vec![FlatLine {
-        record_id: 1,
-        line_index: 0,
-        segments: vec![],
-        raw: "err error err".to_string(),
-        level: None,
-        collapsible: false,
-        collapsed: false,
-        hidden_line_count: 0,
-    }];
+    let lines = vec![flat("err error err")];
     let any = compile_search_pattern("err", false, false, false).unwrap();
     let whole = compile_search_pattern("err", false, false, true).unwrap();
     assert_eq!(collect_search_matches(&lines, &any).len(), 3); // err, err in error, err
@@ -350,19 +323,9 @@ fn search_set_persists_case_and_whole_word_flags() {
 
 #[test]
 fn search_regex_mode_matches_pattern() {
-    use crate::core::types::FlatLine;
     use crate::core::visible::{collect_search_matches, compile_search_pattern};
 
-    let lines = vec![FlatLine {
-        record_id: 1,
-        line_index: 0,
-        segments: vec![],
-        raw: "GET /api/users 200".to_string(),
-        level: None,
-        collapsible: false,
-        collapsed: false,
-        hidden_line_count: 0,
-    }];
+    let lines = vec![flat("GET /api/users 200")];
     let pattern = compile_search_pattern(r"GET /api/\w+", true, false, false).unwrap();
     let matches = collect_search_matches(&lines, &pattern);
     assert_eq!(matches.len(), 1);
@@ -500,9 +463,7 @@ fn search_incremental_append_extends_matches() {
     assert_eq!(view.search_match_scan_end_for_test(), 2);
 }
 
-/// End-to-end: real interactive Strapi capture through the terminal
-/// emulator preserves every finalized line and colours, with filters
-/// applied over the committed records.
+/// SearchGoto advances the active match index and dirties the viewport.
 #[test]
 fn search_goto_advances_match_and_dirties_viewport() {
     use crate::engine::Engine;

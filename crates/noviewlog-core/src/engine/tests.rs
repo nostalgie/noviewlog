@@ -125,9 +125,10 @@ fn idle_tick_emits_stats_only_and_stays_clean() {
     engine.render(800, 600, &mut out).expect("render");
     assert!(!engine.needs_render());
 
-    // Cross the stats throttle window (250 ms) so the next tick is
-    // stats-eligible, mirroring the caret test's timing approach.
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    // Cross the stats throttle window (250 ms) without sleeping: backdate
+    // the last emission so the next tick is stats-eligible (issue #325 —
+    // fixed sleeps over 50 ms must not live in the fast tier).
+    engine.last_stats_at = Some(Instant::now() - std::time::Duration::from_millis(300));
     engine.tick();
     assert!(
         !engine.needs_render(),
@@ -287,11 +288,13 @@ fn flush_persist_test_mode_clears_dirty_without_writes() {
 
     engine.config_dirty = true;
     engine.projects_dirty = true;
-    engine.persist_changed_at = Some(Instant::now());
+    engine.projects_persist_changed_at = Some(Instant::now());
+    engine.config_persist_changed_at = Some(Instant::now());
     engine.flush_persist();
     assert!(!engine.config_dirty);
     assert!(!engine.projects_dirty);
-    assert!(engine.persist_changed_at.is_none());
+    assert!(engine.projects_persist_changed_at.is_none());
+    assert!(engine.config_persist_changed_at.is_none());
 }
 
 #[test]
@@ -326,7 +329,10 @@ fn persist_failure_retries_with_backoff_and_announces_once() {
         engine.config_dirty,
         "failed save must stay dirty (issue #109)"
     );
-    assert_eq!(engine.persist_retry_delay, Duration::from_millis(3000));
+    assert_eq!(
+        engine.config_persist_retry_delay,
+        Duration::from_millis(3000)
+    );
     assert_eq!(
         drain_events(&mut engine).len(),
         1,
@@ -338,7 +344,7 @@ fn persist_failure_retries_with_backoff_and_announces_once() {
     engine.flush_persist();
     engine.flush_persist();
     assert_eq!(
-        engine.persist_retry_delay, PERSIST_RETRY_MAX,
+        engine.config_persist_retry_delay, PERSIST_RETRY_MAX,
         "backoff caps at 30 s"
     );
     assert_eq!(
@@ -351,7 +357,7 @@ fn persist_failure_retries_with_backoff_and_announces_once() {
     engine.persist_fail_saves = false;
     engine.flush_persist();
     assert!(!engine.config_dirty);
-    assert_eq!(engine.persist_retry_delay, PERSIST_DEBOUNCE);
+    assert_eq!(engine.config_persist_retry_delay, PERSIST_DEBOUNCE);
     assert!(!engine.config_failure_announced);
     engine.skip_projects_persist = true;
 }
@@ -373,17 +379,18 @@ fn fresh_dirty_mark_resets_backoff_so_new_edit_persists_promptly() {
     for _ in 0..4 {
         engine.flush_persist();
     }
-    assert_eq!(engine.persist_retry_delay, PERSIST_RETRY_MAX);
+    assert_eq!(engine.config_persist_retry_delay, PERSIST_RETRY_MAX);
 
     // A NEW user edit (cause resolved) re-arms the normal debounce: the very
     // next flush after the debounce window must succeed, not wait 30 s.
     engine.persist_fail_saves = false;
     engine.mark_config_dirty();
     assert_eq!(
-        engine.persist_retry_delay, PERSIST_DEBOUNCE,
+        engine.config_persist_retry_delay, PERSIST_DEBOUNCE,
         "a fresh dirty mark must reset the backoff (issue #253)"
     );
-    engine.persist_changed_at = Some(Instant::now() - PERSIST_DEBOUNCE - Duration::from_millis(1));
+    engine.config_persist_changed_at =
+        Some(Instant::now() - PERSIST_DEBOUNCE - Duration::from_millis(1));
     engine.flush_persist();
     assert!(!engine.config_dirty, "fresh edit must persist immediately");
     engine.skip_projects_persist = true;
@@ -496,4 +503,110 @@ fn stalled_file_load_does_not_report_host_work() {
     );
     engine.advance_file_load();
     assert!(engine.terminals[0].file_load.is_none());
+}
+
+#[test]
+fn corrupt_explicit_config_is_reported_not_silent() {
+    // Issue #321: a user-named config file with a YAML typo must surface a
+    // status message instead of silently falling back to bundled defaults
+    // (the same contract as the quarantined user config.yaml).
+    let mut engine = Engine::new();
+    engine.tick();
+    let path = std::env::temp_dir().join(format!(
+        "noviewlog-bad-config-{}-{}.yaml",
+        std::process::id(),
+        line!()
+    ));
+    std::fs::write(&path, "default_format: [unclosed").unwrap();
+
+    engine.set_launch(LaunchConfig {
+        config_path: Some(path.to_string_lossy().to_string()),
+        ..LaunchConfig::default()
+    });
+    let events = drain_events(&mut engine);
+    assert!(
+        events
+            .iter()
+            .any(|e| e.contains("\"type\":\"status\"") && e.contains("corrupt")),
+        "expected a corrupt-config status event, got {events:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn valid_explicit_config_stays_quiet() {
+    let mut engine = Engine::new();
+    engine.tick();
+    let path = std::env::temp_dir().join(format!(
+        "noviewlog-good-config-{}-{}.yaml",
+        std::process::id(),
+        line!()
+    ));
+    std::fs::write(&path, "max_scrollback_lines: 12345\n").unwrap();
+
+    engine.set_launch(LaunchConfig {
+        config_path: Some(path.to_string_lossy().to_string()),
+        ..LaunchConfig::default()
+    });
+    let events = drain_events(&mut engine);
+    assert!(
+        !events
+            .iter()
+            .any(|e| e.contains("\"type\":\"status\"") && e.contains("corrupt")),
+        "a valid config must not report corruption: {events:?}"
+    );
+    assert_eq!(engine.config.max_scrollback_lines, 12345);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn projects_success_does_not_reset_config_backoff() {
+    // Issue #326: the retry backoff is per store — a projects save success
+    // (or a fresh projects dirty mark) must not reset the config store's
+    // failure backoff, which otherwise retries far more often than the
+    // ×4-to-30 s design intends.
+    let mut engine = Engine::new();
+    let _guard = crate::tests::USER_CONFIG_LOCK
+        .lock()
+        .expect("user config lock");
+    engine.skip_projects_persist = false;
+    engine.persist_fail_saves = true;
+    engine.mark_config_dirty();
+    engine.flush_persist();
+    assert_eq!(
+        engine.config_persist_retry_delay,
+        Duration::from_millis(3000),
+        "config failure grows its own backoff"
+    );
+
+    // Projects saves cleanly while the config store keeps failing (its
+    // still-dirty state retries in the same flush and grows 3 s -> 12 s).
+    engine.persist_fail_saves = false;
+    engine.persist_fail_config_only = true;
+    engine.projects_dirty = true;
+    engine.flush_persist();
+    assert!(!engine.projects_dirty, "projects save succeeds");
+    assert_eq!(
+        engine.config_persist_retry_delay,
+        Duration::from_millis(12_000),
+        "projects success must not reset the config backoff: with the shared \
+         field this was reset to the 750 ms debounce (issue #326)"
+    );
+    assert!(
+        engine.config_dirty,
+        "config stays dirty on its own backoff schedule"
+    );
+
+    // Mirror case: a projects failure must not grow the config backoff
+    // (config saves cleanly here).
+    engine.config_persist_retry_delay = PERSIST_DEBOUNCE;
+    engine.persist_fail_config_only = false;
+    engine.persist_fail_projects_only = true;
+    engine.projects_dirty = true;
+    engine.flush_persist();
+    assert!(engine.projects_dirty);
+    assert!(engine.projects_persist_retry_delay > PERSIST_DEBOUNCE);
+    assert_eq!(engine.config_persist_retry_delay, PERSIST_DEBOUNCE);
+    assert!(!engine.config_dirty, "config saved cleanly");
+    engine.skip_projects_persist = true;
 }

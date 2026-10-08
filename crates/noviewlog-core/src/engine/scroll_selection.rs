@@ -21,6 +21,21 @@ impl Engine {
         if delta == 0 {
             return;
         }
+        let row_stride = self.renderer.metrics().row_stride;
+        self.scroll_by_pixels(delta as f32 * row_stride);
+    }
+
+    pub(crate) fn scroll_page(&mut self, direction: i32) {
+        if direction == 0 {
+            return;
+        }
+        let page = self.viewport_height as f32 * 0.9;
+        self.scroll_by_pixels(direction.signum() as f32 * page);
+    }
+
+    /// Shared wheel / page scroll: materialize live grid, apply pixel delta,
+    /// then sync Follow / file prefetch / match window (issue #339).
+    fn scroll_by_pixels(&mut self, delta_px: f32) {
         if !self.active_terminal().is_file_session() {
             let (was_live, _) = self.materialize_overlay_for_user_scroll();
             if was_live {
@@ -30,7 +45,6 @@ impl Engine {
                 self.active_terminal_mut().scroll_offset_y = max;
             }
         }
-        let row_stride = self.renderer.metrics().row_stride;
         let max_scroll = if self.active_terminal().is_file_session()
             && self.active_terminal().file_backed.is_some()
         {
@@ -39,38 +53,7 @@ impl Engine {
             self.max_scroll_offset()
         };
         let terminal = self.active_terminal_mut();
-        terminal.scroll_offset_y =
-            (terminal.scroll_offset_y + delta as f32 * row_stride).clamp(0.0, max_scroll);
-        self.sync_follow_from_scroll();
-        self.maybe_prefetch_file_window();
-        if self.active_terminal().is_file_session() && self.active_view().uses_match_index() {
-            self.apply_match_window();
-        }
-        self.mark_viewport_dirty();
-    }
-
-    pub(crate) fn scroll_page(&mut self, direction: i32) {
-        if direction == 0 {
-            return;
-        }
-        if !self.active_terminal().is_file_session() {
-            let (was_live, _) = self.materialize_overlay_for_user_scroll();
-            if was_live {
-                let max = self.max_scroll_offset();
-                self.active_terminal_mut().scroll_offset_y = max;
-            }
-        }
-        let page = self.viewport_height as f32 * 0.9;
-        let max_scroll = if self.active_terminal().is_file_session()
-            && self.active_terminal().file_backed.is_some()
-        {
-            self.local_window_max_scroll()
-        } else {
-            self.max_scroll_offset()
-        };
-        let terminal = self.active_terminal_mut();
-        terminal.scroll_offset_y =
-            (terminal.scroll_offset_y + direction.signum() as f32 * page).clamp(0.0, max_scroll);
+        terminal.scroll_offset_y = (terminal.scroll_offset_y + delta_px).clamp(0.0, max_scroll);
         self.sync_follow_from_scroll();
         self.maybe_prefetch_file_window();
         if self.active_terminal().is_file_session() && self.active_view().uses_match_index() {
@@ -101,7 +84,7 @@ impl Engine {
             if self.active_view().uses_match_index() {
                 self.scroll_match_to_global_offset(0.0);
             } else {
-                self.request_file_window_at(0, 0.0);
+                self.request_file_window_at(0, 0.0, false);
             }
         } else {
             self.active_terminal_mut().scroll_offset_y = 0.0;
@@ -259,7 +242,14 @@ impl Engine {
                 if local_rows_h > 0.0 {
                     content_h = content_h.max(start as f32 * stride + local_rows_h);
                 }
-                return (content_h - self.viewport_height as f32).max(0.0);
+                let mut max_y = (content_h - self.viewport_height as f32).max(0.0);
+                // WRAP: resident scroll is visual px; a stale or file-line `content_h`
+                // can sit below `scroll_offset_y`, clamping stats below reality (#339).
+                let resident_top = terminal.buffer_line_start as f32 * stride;
+                max_y = max_y
+                    .max(resident_top + self.local_window_max_scroll())
+                    .max(resident_top + terminal.scroll_offset_y);
+                return max_y;
             }
         }
 
@@ -359,14 +349,7 @@ impl Engine {
                         return (0, 0);
                     }
                     let local_y = terminal.scroll_offset_y;
-                    let index =
-                        view.ensure_visual_row_index(self.viewport_width, metrics.cell_width);
-                    let top_visual = (local_y / stride).floor().max(0.0) as usize;
-                    let top_visual = top_visual.min(index.total_rows().saturating_sub(1));
-                    let flat = index
-                        .flat_at_visual_row(top_visual)
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
+                    let flat = self.top_flat_line(view, local_y, stride, metrics.cell_width);
                     let cur = (view.match_window_start as u64 + flat as u64 + 1).min(total.max(1));
                     let at_eof = local_y + 1.0 >= self.local_window_max_scroll() || total <= 1;
                     let cur = if at_eof { total } else { cur };
@@ -376,32 +359,17 @@ impl Engine {
                 if total == 0 {
                     return (0, 0);
                 }
-                let (base, local_y, pin_end) = if let Some(pending) = &terminal.pending_file_window
-                {
-                    (
-                        pending.new_start,
-                        pending.scroll_y,
-                        pending.scroll_y >= 1.0e20,
-                    )
-                } else {
-                    (terminal.buffer_line_start, terminal.scroll_offset_y, false)
-                };
-                if pin_end {
-                    return (total, total);
-                }
-                let index = view.ensure_visual_row_index(self.viewport_width, metrics.cell_width);
-                let top_visual = (local_y / stride).floor().max(0.0) as usize;
-                let top_visual = top_visual.min(index.total_rows().saturating_sub(1));
-                let flat = index
-                    .flat_at_visual_row(top_visual)
-                    .map(|(i, _)| i)
-                    .unwrap_or(0);
+                // Line counter follows the resident buffer only — pending global Y is
+                // for the scrollbar thumb, not file lines (#339).
+                let base = terminal.buffer_line_start;
+                let local_y = terminal.scroll_offset_y;
+                let flat = self.top_flat_line(view, local_y, stride, metrics.cell_width);
                 let cur = (base + flat as u64 + 1).min(total.max(1));
-                // At (or past) max scroll, snap to last file line so EOF reads `N / N`.
-                // Near the f32 ~2^24 px boundary the 1 px tolerance is finer than
-                // the quantization, but both sides share the same quantized max,
-                // so the clamp still compares equal at EOF (#237).
-                let at_eof = self.stats_scroll_y() + 1.0 >= self.max_scroll_offset();
+                let window = self.file_view_window_lines() as u64;
+                let max_start = total.saturating_sub(window);
+                let at_eof = terminal.pending_file_window.is_none()
+                    && base >= max_start
+                    && local_y + 1.0 >= self.local_window_max_scroll();
                 let cur = if at_eof { total } else { cur };
                 return (cur, total);
             }
@@ -426,17 +394,28 @@ impl Engine {
             return (0, 0);
         }
         let local_y = terminal.scroll_offset_y;
-        let index = view.ensure_visual_row_index(self.viewport_width, metrics.cell_width);
-        let top_visual = (local_y / stride).floor().max(0.0) as usize;
-        let top_visual = top_visual.min(index.total_rows().saturating_sub(1));
-        let flat = index
-            .flat_at_visual_row(top_visual)
-            .map(|(i, _)| i)
-            .unwrap_or(0);
+        let flat = self.top_flat_line(view, local_y, stride, metrics.cell_width);
         let cur = (flat as u64 + 1).min(total);
         let at_eof = local_y + 1.0 >= self.local_window_max_scroll() || total <= 1;
         let cur = if at_eof { total } else { cur };
         (cur, total)
+    }
+
+    /// Flat-line index at the top of the viewport for `local_y` (issue #339).
+    fn top_flat_line(
+        &self,
+        view: &crate::log_view::LogView,
+        local_y: f32,
+        stride: f32,
+        cell_width: u32,
+    ) -> usize {
+        let index = view.ensure_visual_row_index(self.viewport_width, cell_width);
+        let top_visual = (local_y / stride).floor().max(0.0) as usize;
+        let top_visual = top_visual.min(index.total_rows().saturating_sub(1));
+        index
+            .flat_at_visual_row(top_visual)
+            .map(|(i, _)| i)
+            .unwrap_or(0)
     }
 
     pub(crate) fn current_max_scroll_x(&self) -> f32 {

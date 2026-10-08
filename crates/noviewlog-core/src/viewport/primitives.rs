@@ -5,7 +5,7 @@ use crate::color_emoji::{
 };
 use crate::core::ansi::strip_ansi;
 use crate::core::types::{LogLevel, TextSegment, TextStyle as LineStyle};
-use crate::viewport_layout::{selection_slice_range, TextSelection};
+use crate::viewport_layout::{floor_char_boundary, selection_slice_range, TextSelection};
 
 pub(super) const BG: [u8; 4] = [0, 0, 0, 255];
 pub(super) const DEFAULT_FG: [u8; 4] = [230, 237, 243, 255];
@@ -63,7 +63,7 @@ pub(super) fn highlight_selection_in_segments(
 
         // Clamp offsets to char boundaries: a selection that survived a buffer
         // swap can hold stale offsets landing mid-character, and plain slicing
-        // would panic (issue #235). Mirrors the guard in selection_plain_text.
+        // would panic (issue #235). Shared with `selection_plain_text`.
         let local_start = floor_char_boundary(&seg.text, abs_start.saturating_sub(seg_start));
         let local_end = floor_char_boundary(&seg.text, (abs_end - seg_start).min(seg.text.len()))
             .max(local_start);
@@ -92,16 +92,6 @@ pub(super) fn highlight_selection_in_segments(
     out
 }
 
-/// Largest char boundary `<= at` (and `<= s.len()`), matching the guard in
-/// `selection_plain_text`.
-fn floor_char_boundary(s: &str, at: usize) -> usize {
-    let at = at.min(s.len());
-    if s.is_char_boundary(at) {
-        at
-    } else {
-        (0..at).rev().find(|&i| s.is_char_boundary(i)).unwrap_or(0)
-    }
-}
 /// (fg, bold, bg, underline) for a segment style.
 pub(super) fn style_to_draw(style: Option<&LineStyle>) -> ([u8; 4], bool, Option<[u8; 4]>, bool) {
     let Some(style) = style else {
@@ -164,6 +154,12 @@ pub(super) fn draw_text(
         col += span.max(0);
         if span == 0 {
             // Combining mark: overlay ink onto the previous cell, no advance.
+            // A mark leading a segment (ANSI split between base and mark) at
+            // the row start has no previous cell — skip it, same rule as the
+            // per-scalar path below (issue #327).
+            if col == 0 {
+                continue;
+            }
             let prev_x = item_x - cell_w;
             if prev_x + cell_w <= 0 || prev_x >= width_i {
                 continue;

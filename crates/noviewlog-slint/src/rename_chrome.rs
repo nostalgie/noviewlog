@@ -48,29 +48,10 @@ pub enum RenamePointer {
 pub fn click_away_dismisses(hit: RenameHit, pointer: RenamePointer) -> bool {
     match pointer {
         RenamePointer::Move | RenamePointer::Leave => false,
-        RenamePointer::Down | RenamePointer::Click => match hit {
-            RenameHit::RenameField => false,
-            RenameHit::SidebarDeadSpace
-            | RenameHit::FilesEmptyStretch
-            | RenameHit::TerminalsEmptyStretch
-            | RenameHit::Viewport
-            | RenameHit::FindBar
-            | RenameHit::StatusBar
-            | RenameHit::LaunchPreview
-            | RenameHit::FollowChip
-            | RenameHit::WrapChip
-            | RenameHit::MenuBar
-            | RenameHit::TabStripGutter
-            | RenameHit::TabChipOther
-            | RenameHit::TabChipRenamingChrome
-            | RenameHit::TerminalRowOther
-            | RenameHit::TerminalRowRenamingChrome
-            | RenameHit::Scrollbar
-            | RenameHit::FilesHeader
-            | RenameHit::TerminalsHeader
-            | RenameHit::SidebarPlus
-            | RenameHit::FilterRow => true,
-        },
+        // Every surface except the active rename field dismisses on press/click.
+        // A new variant dismisses by default; add it to `ALL_RENAME_HITS` in
+        // the tests below so the contract stays covered.
+        RenamePointer::Down | RenamePointer::Click => !matches!(hit, RenameHit::RenameField),
     }
 }
 
@@ -88,7 +69,10 @@ pub fn sidebar_list_height_px(count: i32, expanded: bool, row_px: i32, gap_px: i
 mod tests {
     use super::*;
 
-    const DISMISS_HITS: &[RenameHit] = &[
+    /// Every RenameHit variant. Add new surfaces here (and bump the length)
+    /// so the contract tests below exercise them.
+    const ALL_RENAME_HITS: [RenameHit; 21] = [
+        RenameHit::RenameField,
         RenameHit::SidebarDeadSpace,
         RenameHit::FilesEmptyStretch,
         RenameHit::TerminalsEmptyStretch,
@@ -111,15 +95,22 @@ mod tests {
         RenameHit::FilterRow,
     ];
 
+    /// Every surface except the rename field itself.
+    fn dismiss_hits() -> impl Iterator<Item = RenameHit> {
+        ALL_RENAME_HITS
+            .into_iter()
+            .filter(|hit| !matches!(hit, RenameHit::RenameField))
+    }
+
     #[test]
     fn every_chrome_surface_except_the_field_dismisses_on_pointer_down() {
-        for hit in DISMISS_HITS {
+        for hit in dismiss_hits() {
             assert!(
-                click_away_dismisses(*hit, RenamePointer::Down),
+                click_away_dismisses(hit, RenamePointer::Down),
                 "{hit:?} down must dismiss"
             );
             assert!(
-                click_away_dismisses(*hit, RenamePointer::Click),
+                click_away_dismisses(hit, RenamePointer::Click),
                 "{hit:?} click must dismiss"
             );
         }
@@ -135,11 +126,7 @@ mod tests {
 
     #[test]
     fn mouse_move_and_leave_never_dismiss() {
-        let all = DISMISS_HITS
-            .iter()
-            .copied()
-            .chain(std::iter::once(RenameHit::RenameField));
-        for hit in all {
+        for hit in ALL_RENAME_HITS {
             assert!(
                 !click_away_dismisses(hit, RenamePointer::Move),
                 "{hit:?} move must keep rename"
@@ -166,38 +153,5 @@ mod tests {
             RenameHit::FilesEmptyStretch,
             RenamePointer::Down
         ));
-    }
-
-    #[test]
-    fn contract_covers_every_hit_variant() {
-        // Fail the build if a new surface is added without a dismiss decision.
-        let variants = [
-            RenameHit::RenameField,
-            RenameHit::SidebarDeadSpace,
-            RenameHit::FilesEmptyStretch,
-            RenameHit::TerminalsEmptyStretch,
-            RenameHit::Viewport,
-            RenameHit::FindBar,
-            RenameHit::StatusBar,
-            RenameHit::LaunchPreview,
-            RenameHit::FollowChip,
-            RenameHit::WrapChip,
-            RenameHit::MenuBar,
-            RenameHit::TabStripGutter,
-            RenameHit::TabChipOther,
-            RenameHit::TabChipRenamingChrome,
-            RenameHit::TerminalRowOther,
-            RenameHit::TerminalRowRenamingChrome,
-            RenameHit::Scrollbar,
-            RenameHit::FilesHeader,
-            RenameHit::TerminalsHeader,
-            RenameHit::SidebarPlus,
-            RenameHit::FilterRow,
-        ];
-        assert_eq!(variants.len(), 21);
-        for hit in variants {
-            let _ = click_away_dismisses(hit, RenamePointer::Down);
-            let _ = click_away_dismisses(hit, RenamePointer::Leave);
-        }
     }
 }

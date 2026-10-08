@@ -70,7 +70,6 @@ describe("chrome: panel toggle and tabs", () => {
     sent = [];
     chrome.onCommand = (cmd) => sent.push(cmd);
     state = stateFrom(snapshotMsg());
-    chrome.state = state;
     chrome.render(state);
   });
 
@@ -109,6 +108,44 @@ describe("chrome: panel toggle and tabs", () => {
     vi.advanceTimersByTime(250);
     expect(sent).toHaveLength(1);
     expect(sent[0]).toMatchObject({ type: "setSearch", query: "needle2" });
+  });
+
+  it("flushes pending Find debounce before Enter searchNext", () => {
+    const find = root.querySelector(".find input") as HTMLInputElement;
+    find.value = "fresh";
+    find.dispatchEvent(new Event("input"));
+    find.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter" }));
+    expect(sent).toEqual([
+      expect.objectContaining({ type: "setSearch", query: "fresh" }),
+      { type: "searchNext" },
+    ]);
+    // Pending debounce must not fire a second setSearch after Enter.
+    vi.advanceTimersByTime(250);
+    expect(sent).toHaveLength(2);
+  });
+
+  it("syncs Find toggle aria-pressed from search state on render", () => {
+    const withFlags = stateFrom(
+      snapshotMsg({
+        view: {
+          ...snapshotMsg().view,
+          search: {
+            ...snapshotMsg().view.search,
+            query: "x",
+            regex: true,
+            case_sensitive: true,
+            whole_word: true,
+          },
+        },
+      }),
+    );
+    chrome.render(withFlags);
+    const regexBtn = [...root.querySelectorAll(".find button")].find((b) => b.textContent === ".*");
+    const caseBtn = [...root.querySelectorAll(".find button")].find((b) => b.textContent === "Aa");
+    const wordBtn = [...root.querySelectorAll(".find button")].find((b) => b.textContent === "|w");
+    expect(regexBtn!.getAttribute("aria-pressed")).toBe("true");
+    expect(caseBtn!.getAttribute("aria-pressed")).toBe("true");
+    expect(wordBtn!.getAttribute("aria-pressed")).toBe("true");
   });
 
   it("shows the exit status badge when a session exits", () => {

@@ -25,12 +25,10 @@ impl Engine {
             }
             terminal.last_line_at = Some(Instant::now());
         }
-        if mark_dirty || shifted {
-            self.mark_all_views_dirty();
-        }
         // Only paint when callers ask (`mark_dirty`) or the window shifted.
         // File load uses mark_dirty=false and paints explicitly at first/last batch.
         if mark_dirty || shifted {
+            self.mark_all_views_dirty();
             self.mark_viewport_dirty();
         }
     }

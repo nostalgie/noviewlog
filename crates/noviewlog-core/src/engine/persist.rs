@@ -18,27 +18,33 @@ enum PersistStore {
 
 impl Engine {
     /// Write dirty `projects.yaml` / `config.yaml` once the gesture burst has
-    /// gone quiet (issue #62). Called from [`Self::tick`].
+    /// gone quiet (issue #62). Called from [`Self::tick`]. Scheduling is per
+    /// store (issue #326): one store's backoff must not delay the other.
     pub(crate) fn flush_persist_if_due(&mut self) {
-        if self
-            .persist_changed_at
-            .is_some_and(|at| at.elapsed() >= self.persist_retry_delay)
-        {
+        let projects_due = self
+            .projects_persist_changed_at
+            .is_some_and(|at| at.elapsed() >= self.projects_persist_retry_delay);
+        let config_due = self
+            .config_persist_changed_at
+            .is_some_and(|at| at.elapsed() >= self.config_persist_retry_delay);
+        if projects_due || config_due {
             self.flush_persist();
         }
     }
 
     /// Flush debounced persistence now (debounce elapsed, or app exit via Drop).
     pub fn flush_persist(&mut self) {
-        self.persist_changed_at = None;
         #[cfg(test)]
         if self.skip_projects_persist {
             self.projects_dirty = false;
             self.config_dirty = false;
+            self.projects_persist_changed_at = None;
+            self.config_persist_changed_at = None;
             return;
         }
         if self.projects_dirty {
             self.projects_dirty = false;
+            self.projects_persist_changed_at = None;
             if let Some(idx) = self.active_project {
                 self.projects.active_project = idx;
             }
@@ -57,6 +63,7 @@ impl Engine {
         }
         if self.config_dirty {
             self.config_dirty = false;
+            self.config_persist_changed_at = None;
             match self.save_config_checked() {
                 Ok(()) => self.persist_recovered(PersistStore::Config),
                 Err(err) => {
@@ -71,7 +78,7 @@ impl Engine {
     /// be tested without a read-only config dir (issue #237).
     #[cfg(test)]
     fn save_projects_checked(&self) -> Result<(), String> {
-        if self.persist_fail_saves {
+        if self.persist_fail_saves || self.persist_fail_projects_only {
             return Err("injected persist failure".into());
         }
         crate::core::config::save_projects_store(&self.projects)
@@ -85,7 +92,7 @@ impl Engine {
     /// Test seam: see [`Self::save_projects_checked`].
     #[cfg(test)]
     fn save_config_checked(&self) -> Result<(), String> {
-        if self.persist_fail_saves {
+        if self.persist_fail_saves || self.persist_fail_config_only {
             return Err("injected persist failure".into());
         }
         save_user_config(&self.config)
@@ -97,14 +104,19 @@ impl Engine {
     }
 
     /// A store saved cleanly: clear the failure backoff and re-arm status
-    /// reporting for the next failure streak (issue #237). Announcement
-    /// state is per store (issue #253): a projects success must not re-arm
-    /// the config failure announcement (and vice versa).
+    /// reporting for the next failure streak (issue #237). Announcement and
+    /// backoff state are per store (issues #253, #326): a projects success
+    /// must not reset the config store's failure backoff (and vice versa).
     fn persist_recovered(&mut self, store: PersistStore) {
-        self.persist_retry_delay = PERSIST_DEBOUNCE;
         match store {
-            PersistStore::Projects => self.projects_failure_announced = false,
-            PersistStore::Config => self.config_failure_announced = false,
+            PersistStore::Projects => {
+                self.projects_persist_retry_delay = PERSIST_DEBOUNCE;
+                self.projects_failure_announced = false;
+            }
+            PersistStore::Config => {
+                self.config_persist_retry_delay = PERSIST_DEBOUNCE;
+                self.config_failure_announced = false;
+            }
         }
     }
 
@@ -113,8 +125,18 @@ impl Engine {
     /// failure of a streak, so a permanently failing save pushes one event
     /// instead of one per debounce period (issue #237).
     fn persist_failed(&mut self, store: PersistStore, message: String) {
-        self.persist_changed_at = Some(Instant::now());
-        self.persist_retry_delay = next_persist_retry_delay(self.persist_retry_delay);
+        match store {
+            PersistStore::Projects => {
+                self.projects_persist_changed_at = Some(Instant::now());
+                self.projects_persist_retry_delay =
+                    next_persist_retry_delay(self.projects_persist_retry_delay);
+            }
+            PersistStore::Config => {
+                self.config_persist_changed_at = Some(Instant::now());
+                self.config_persist_retry_delay =
+                    next_persist_retry_delay(self.config_persist_retry_delay);
+            }
+        }
         let announced = match store {
             PersistStore::Projects => &mut self.projects_failure_announced,
             PersistStore::Config => &mut self.config_failure_announced,
@@ -139,8 +161,8 @@ impl Engine {
             return;
         }
         self.config_dirty = true;
-        self.persist_changed_at = Some(Instant::now());
-        self.persist_retry_delay = PERSIST_DEBOUNCE;
+        self.config_persist_changed_at = Some(Instant::now());
+        self.config_persist_retry_delay = PERSIST_DEBOUNCE;
     }
 
     pub(crate) fn preset_apply(&mut self, name: &str) {

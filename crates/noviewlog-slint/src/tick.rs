@@ -1,7 +1,7 @@
 //! Host tick: the UI-thread body run by the repeated timer and by PTY wakes.
 //! Owns the `HOST_TICK` TLS slot, flood pacing, and the PTY activity wake.
 
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, RefCell, RefMut};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -14,7 +14,8 @@ use slint::{
 
 use crate::caret::sync_terminal_caret;
 use crate::engine_bridge::{
-    bump_fast_timer, set_occluded_timer, window_should_pause_paint, TICK_FAST, TICK_IDLE,
+    bump_fast_timer, device_size, set_occluded_timer, window_should_pause_paint, TICK_FAST,
+    TICK_IDLE,
 };
 use crate::find::FindPending;
 use noviewlog_slint::stats_sync::apply_stats;
@@ -46,6 +47,7 @@ pub(crate) struct TickDeps {
     pub(crate) was_occluded: Rc<Cell<bool>>,
     pub(crate) viewport_presented: Rc<Cell<bool>>,
     pub(crate) syncing_scroll: Rc<Cell<bool>>,
+    pub(crate) scrollbar_drag_active: Rc<Cell<bool>>,
     pub(crate) syncing_follow: Rc<Cell<bool>>,
     pub(crate) has_selection: Rc<Cell<bool>>,
     pub(crate) pty_running: Rc<Cell<bool>>,
@@ -69,6 +71,40 @@ pub(crate) struct TickControls {
     pub(crate) schedule_host_tick: Arc<dyn Fn() + Send + Sync>,
 }
 
+/// Clear the re-entrancy latch, publish flood pacing, and optionally re-arm
+/// the fast timer. `bump` is false only on the occluded path, which must stay
+/// on `TICK_OCCLUDED`.
+fn release_tick(
+    more: bool,
+    ticking: &AtomicBool,
+    flood_pacing: &AtomicBool,
+    timer: &Timer,
+    timer_fast: &Cell<bool>,
+    bump: bool,
+) {
+    ticking.store(false, Ordering::Release);
+    flood_pacing.store(more, Ordering::Release);
+    if more && bump {
+        bump_fast_timer(timer, timer_fast);
+    }
+}
+
+/// Early-exit tail: decide whether another tick is owed, drop the engine
+/// borrow, then [`release_tick`].
+fn finish_tick(
+    mut eng: RefMut<'_, Engine>,
+    needs_retick: &AtomicBool,
+    ticking: &AtomicBool,
+    flood_pacing: &AtomicBool,
+    timer: &Timer,
+    timer_fast: &Cell<bool>,
+    bump: bool,
+) {
+    let more = needs_retick.load(Ordering::Acquire) || eng.take_pty_drain_pending();
+    drop(eng);
+    release_tick(more, ticking, flood_pacing, timer, timer_fast, bump);
+}
+
 pub(crate) fn install_host_tick(deps: TickDeps) -> TickControls {
     let TickDeps {
         ui: ui_weak,
@@ -87,6 +123,7 @@ pub(crate) fn install_host_tick(deps: TickDeps) -> TickControls {
         was_occluded: was_occluded_tick,
         viewport_presented: presented_tick,
         syncing_scroll: syncing_scroll_tick,
+        scrollbar_drag_active: scrollbar_drag_active_tick,
         syncing_follow: syncing_follow_tick,
         has_selection: has_selection_tick,
         pty_running: pty_running_tick,
@@ -195,10 +232,16 @@ pub(crate) fn install_host_tick(deps: TickDeps) -> TickControls {
                 if became_occluded || timer_fast_tick.get() {
                     set_occluded_timer(&timer_tick, &timer_fast_tick);
                 }
-                let more = needs_retick.load(Ordering::Acquire) || eng.take_pty_drain_pending();
-                drop(eng);
-                ticking.store(false, Ordering::Release);
-                flood_pacing.store(more, Ordering::Release);
+                // bump=false: occluded must stay on TICK_OCCLUDED, never TICK_FAST.
+                finish_tick(
+                    eng,
+                    &needs_retick,
+                    &ticking,
+                    &flood_pacing,
+                    &timer_tick,
+                    &timer_fast_tick,
+                    false,
+                );
                 return;
             }
 
@@ -215,6 +258,7 @@ pub(crate) fn install_host_tick(deps: TickDeps) -> TickControls {
                             &ui,
                             &terminal_tab_tick,
                             &syncing_scroll_tick,
+                            &scrollbar_drag_active_tick,
                             &has_selection_tick,
                             &pty_running_tick,
                             &viewport_font_size_tick,
@@ -252,18 +296,19 @@ pub(crate) fn install_host_tick(deps: TickDeps) -> TickControls {
 
             let (lw, lh) = *logical_tick.borrow();
             if lw <= 1.0 || lh <= 1.0 {
-                let more = needs_retick.load(Ordering::Acquire) || eng.take_pty_drain_pending();
-                drop(eng);
-                ticking.store(false, Ordering::Release);
-                flood_pacing.store(more, Ordering::Release);
-                if more {
-                    bump_fast_timer(&timer_tick, &timer_fast_tick);
-                }
+                finish_tick(
+                    eng,
+                    &needs_retick,
+                    &ticking,
+                    &flood_pacing,
+                    &timer_tick,
+                    &timer_fast_tick,
+                    true,
+                );
                 return;
             }
             let scale = ui.window().scale_factor().max(0.5) as f32;
-            let width = (lw * scale).ceil().max(1.0) as u32;
-            let height = (lh * scale).ceil().max(1.0) as u32;
+            let (width, height) = device_size((lw, lh), scale);
             ui.set_viewport_page_w(width as f32);
             ui.set_viewport_page_h(height as f32);
 
@@ -277,13 +322,15 @@ pub(crate) fn install_host_tick(deps: TickDeps) -> TickControls {
 
             if !dirty {
                 // Ingest-only: wait for TICK_FAST. Do not schedule_host_tick (busy drain).
-                let more = needs_retick.load(Ordering::Acquire) || eng.take_pty_drain_pending();
-                drop(eng);
-                ticking.store(false, Ordering::Release);
-                flood_pacing.store(more, Ordering::Release);
-                if more {
-                    bump_fast_timer(&timer_tick, &timer_fast_tick);
-                }
+                finish_tick(
+                    eng,
+                    &needs_retick,
+                    &ticking,
+                    &flood_pacing,
+                    &timer_tick,
+                    &timer_fast_tick,
+                    true,
+                );
                 return;
             }
             force_tick.set(false);
@@ -328,11 +375,14 @@ pub(crate) fn install_host_tick(deps: TickDeps) -> TickControls {
                 ui.window().request_redraw();
             }
 
-            ticking.store(false, Ordering::Release);
-            flood_pacing.store(more, Ordering::Release);
-            if more {
-                bump_fast_timer(&timer_tick, &timer_fast_tick);
-            }
+            release_tick(
+                more,
+                &ticking,
+                &flood_pacing,
+                &timer_tick,
+                &timer_fast_tick,
+                true,
+            );
         }));
     });
 

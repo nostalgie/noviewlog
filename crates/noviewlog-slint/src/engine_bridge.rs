@@ -22,6 +22,17 @@ pub(crate) fn bump_fast_timer(timer: &Timer, timer_fast: &Cell<bool>) {
     }
 }
 
+/// Logical → device pixels for the viewport Image / caret overlay.
+///
+/// `scale.max(0.5)` is defensive against a zero/garbage window scale factor
+/// (never paint a 0×0 buffer). Result is at least 1×1.
+pub(crate) fn device_size(logical: (f32, f32), scale: f32) -> (u32, u32) {
+    let scale = scale.max(0.5);
+    let width = (logical.0 * scale).ceil().max(1.0) as u32;
+    let height = (logical.1 * scale).ceil().max(1.0) as u32;
+    (width, height)
+}
+
 pub(crate) fn set_occluded_timer(timer: &Timer, timer_fast: &Cell<bool>) {
     timer.set_interval(TICK_OCCLUDED);
     timer_fast.set(false);
