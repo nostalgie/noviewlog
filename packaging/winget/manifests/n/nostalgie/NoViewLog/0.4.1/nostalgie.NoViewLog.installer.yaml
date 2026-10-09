@@ -1,0 +1,22 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.installer.1.10.0.schema.json
+
+PackageIdentifier: nostalgie.NoViewLog
+PackageVersion: 0.4.1
+InstallerLocale: en-US
+InstallerType: zip
+NestedInstallerType: portable
+NestedInstallerFiles:
+  - RelativeFilePath: NoViewLog.exe
+UpgradeBehavior: uninstallPrevious
+Commands:
+  - NoViewLog
+Dependencies:
+  PackageDependencies:
+    - PackageIdentifier: Microsoft.VCRedist.2015+.x64
+ReleaseDate: 2026-10-08
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/nostalgie/noviewlog/releases/download/v0.4.1/noviewlog-win-x64.zip
+    InstallerSha256: 3385ED5AF87470866ECDFE97426DD0B5B2194A362996B564A016340B71CB9650
+ManifestType: installer
+ManifestVersion: 1.10.0

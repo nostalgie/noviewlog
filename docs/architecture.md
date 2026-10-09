@@ -54,10 +54,13 @@ so the first map never composites the desktop through an empty cell.
 
 ## Dual ANSI paths
 
-| Layer | Module | Role |
-|-------|--------|------|
-| Live VT | `core/terminal.rs` | `vte` grid; Follow paints grid rows; scroll-up overlay `FlatLine`s from cells; committed rows serialized to ANSI for Records |
-| Line SGR | `core/ansi.rs` | Parse/strip/overlay SGR on stored record lines (non-VT) |
+Both layers live in **`noviewlog-terminal`** and are re-exported as
+`noviewlog_core::core::*` for desktop/TUI code.
+
+| Layer | Crate path | Re-export | Role |
+|-------|------------|-----------|------|
+| Live VT | `noviewlog-terminal/src/terminal/` | `noviewlog_core::core::terminal` | `vte` grid; Follow paints grid rows; scroll-up overlay `FlatLine`s from cells; committed rows serialized to ANSI for Records |
+| Line SGR | `noviewlog-terminal/src/ansi.rs` | `noviewlog_core::core::ansi` | Parse/strip/overlay SGR on stored record lines (non-VT) |
 
 When fixing coloring or escape handling, identify which layer owns the bug
 before changing code.

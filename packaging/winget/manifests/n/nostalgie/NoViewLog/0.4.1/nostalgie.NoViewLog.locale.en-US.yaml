@@ -1,0 +1,28 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
+
+PackageIdentifier: nostalgie.NoViewLog
+PackageVersion: 0.4.1
+PackageLocale: en-US
+Publisher: nostalgie
+PublisherUrl: https://github.com/nostalgie
+PublisherSupportUrl: https://github.com/nostalgie/noviewlog/issues
+PackageName: NoViewLog
+PackageUrl: https://github.com/nostalgie/noviewlog
+License: MIT
+LicenseUrl: https://github.com/nostalgie/noviewlog/blob/main/LICENSE
+ShortDescription: Native desktop live log workspace for local builds and dev servers
+Description: |
+  NoViewLog is a native desktop log viewer for developers who run builds, dev servers,
+  and other processes locally. Launch a command or open a log file, filter output with
+  tabs, follow live streams, and search large logs quickly. The Windows build is a
+  portable zip (not Authenticode-signed); SmartScreen may warn on first run after install.
+Moniker: noviewlog
+Tags:
+  - log
+  - logs
+  - developer
+  - terminal
+  - viewer
+ReleaseNotesUrl: https://github.com/nostalgie/noviewlog/releases/tag/v0.4.1
+ManifestType: defaultLocale
+ManifestVersion: 1.10.0

@@ -1,0 +1,210 @@
+// Modal dialog panels hosted by AppWindow PopupWindows.
+// Keep PopupWindow shells in app.slint so `parent` centers on the window
+// (PopupWindow nested in a child component sees the wrong parent width).
+
+import { SpinBox } from "std-widgets.slint";
+import { Theme } from "theme.slint";
+import { FormTextField, FormCheckField, FormDialogPanel } from "form-dialogs.slint";
+
+/// Edit Program / shell launch command, args, cwd, optional WSL.
+export component EditLaunchDialog inherits FormDialogPanel {
+    in property <bool> host-is-windows: false;
+    in-out property <string> command-draft: "";
+    in-out property <string> args-draft: "";
+    in-out property <string> cwd-draft: "";
+    in-out property <bool> wsl-draft: false;
+    in-out property <string> wsl-distro-draft: "";
+
+    title: "Edit launch";
+    ok-text: "Save";
+    width: 100%;
+
+    launch-command-field := FormTextField {
+        label: "Command (empty = interactive shell)";
+        text <=> root.command-draft;
+        focus-on-init: true;
+        accepted => { root.confirmed(); }
+        cancelled => { root.cancelled(); }
+        tab-move(shift) => {
+            if (shift) { launch-cwd-field.take-focus(); }
+            else { launch-args-field.take-focus(); }
+        }
+    }
+    launch-args-field := FormTextField {
+        label: "Args (space-separated)";
+        text <=> root.args-draft;
+        accepted => { root.confirmed(); }
+        cancelled => { root.cancelled(); }
+        tab-move(shift) => {
+            if (shift) { launch-command-field.take-focus(); }
+            else {
+                // Forward into the distro field when it is visible.
+                if (root.host-is-windows && root.wsl-draft) {
+                    launch-wsl-distro-field.take-focus();
+                } else {
+                    launch-cwd-field.take-focus();
+                }
+            }
+        }
+    }
+    if root.host-is-windows: FormCheckField {
+        label: "Run in WSL";
+        checked <=> root.wsl-draft;
+    }
+    // `visible`, not `if`: the id must stay reachable from the
+    // neighbouring fields' tab-move handlers, and invisible elements
+    // occupy no layout space anyway.
+    launch-wsl-distro-field := FormTextField {
+        visible: root.host-is-windows && root.wsl-draft;
+        label: "WSL distro (empty = default)";
+        text <=> root.wsl-distro-draft;
+        accepted => { root.confirmed(); }
+        cancelled => { root.cancelled(); }
+        tab-move(shift) => {
+            if (shift) { launch-args-field.take-focus(); }
+            else { launch-cwd-field.take-focus(); }
+        }
+    }
+    launch-cwd-field := FormTextField {
+        label: root.host-is-windows && root.wsl-draft
+            ? "Working directory (Linux path, e.g. /home/...)"
+            : "Working directory";
+        text <=> root.cwd-draft;
+        accepted => { root.confirmed(); }
+        cancelled => { root.cancelled(); }
+        tab-move(shift) => {
+            if (shift) {
+                // Include the distro field only while it is visible,
+                // otherwise Shift+Tab from cwd skips back to args.
+                if (root.host-is-windows && root.wsl-draft) {
+                    launch-wsl-distro-field.take-focus();
+                } else {
+                    launch-args-field.take-focus();
+                }
+            } else {
+                launch-command-field.take-focus();
+            }
+        }
+    }
+}
+
+/// Settings — max scrollback lines (SpinBox).
+export component SettingsDialog inherits FormDialogPanel {
+    in-out property <int> settings-draft: 10000;
+
+    title: "Settings";
+    ok-text: "OK";
+    width: 100%;
+
+    VerticalLayout {
+        spacing: 6px;
+        width: 100%;
+        Text {
+            text: "Max scrollback lines";
+            color: Theme.text-muted;
+            font-size: 11px;
+            font-weight: 700;
+        }
+        SpinBox {
+            minimum: 100;
+            maximum: 30000;
+            step-size: 1000;
+            value <=> root.settings-draft;
+        }
+        Text {
+            text: "Oldest lines are dropped when the limit is exceeded (100–30000).";
+            color: Theme.text-secondary;
+            font-size: 11px;
+            wrap: word-wrap;
+        }
+    }
+}
+
+/// About — product info + Slint Royalty-free attribution.
+export component AboutDialog inherits FormDialogPanel {
+    callback open-slint-site();
+
+    title: "About";
+    ok-text: "OK";
+    show-cancel: false;
+    width: 100%;
+
+    HorizontalLayout {
+        spacing: 12px;
+        alignment: start;
+
+        Image {
+            source: @image-url("assets/icon.png");
+            width: 32px;
+            height: 32px;
+            image-fit: contain;
+        }
+
+        VerticalLayout {
+            spacing: 4px;
+            alignment: center;
+            Text {
+                text: "NoViewLog";
+                color: Theme.text-primary;
+                font-size: 16px;
+                font-weight: 700;
+            }
+            Text {
+                text: "Native desktop log viewer";
+                color: Theme.text-secondary;
+                font-size: 12px;
+            }
+        }
+    }
+
+    HorizontalLayout {
+        spacing: 0px;
+        alignment: start;
+
+        Text {
+            text: "UI built with Slint — see ";
+            color: Theme.text-muted;
+            font-size: 11px;
+            wrap: no-wrap;
+        }
+
+        Rectangle {
+            horizontal-stretch: 0;
+            VerticalLayout {
+                spacing: 1px;
+                Text {
+                    text: "slint.dev";
+                    color: slint-link.has-hover ? Theme.text-primary : Theme.text-secondary;
+                    font-size: 11px;
+                    wrap: no-wrap;
+                }
+                Rectangle {
+                    height: 1px;
+                    background: slint-link.has-hover ? Theme.text-primary : Theme.text-secondary;
+                }
+            }
+            slint-link := TouchArea {
+                width: 100%;
+                height: 100%;
+                mouse-cursor: pointer;
+                clicked => { root.open-slint-site(); }
+            }
+        }
+    }
+}
+
+/// Quit confirm — caption X / File → Exit / Alt+F4.
+export component QuitConfirmDialog inherits FormDialogPanel {
+    title: "Close NoViewLog?";
+    ok-text: "Close";
+    cancel-text: "Cancel";
+    footer-start: true;
+    width: 100%;
+
+    Text {
+        text: "Running terminals will stop. Project settings stay saved.";
+        color: Theme.text-secondary;
+        font-size: 12px;
+        wrap: word-wrap;
+    }
+}

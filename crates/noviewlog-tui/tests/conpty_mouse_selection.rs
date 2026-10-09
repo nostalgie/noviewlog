@@ -29,8 +29,8 @@ const COLS: u16 = 100;
 const ROWS: u16 = 30;
 /// TUI content area height (`rows - 3`: tab bar + input + status).
 const CONTENT_ROWS: usize = (ROWS - 3) as usize;
-/// Selection bg as the emulator decodes crossterm `Color::DarkBlue` (SGR 44):
-/// `ansi_basic_color(4, false)` from noviewlog-terminal/src/ansi.rs.
+/// Selection bg as the emulator decodes crossterm `Color::DarkBlue`
+/// (`48;5;4` in crossterm 0.29 → `ansi_basic_color(4, false)`).
 const SELECTION_BG: (u8, u8, u8) = (88, 166, 255);
 
 struct Tui {
@@ -61,7 +61,14 @@ impl Tui {
                 pixel_height: 0,
             })
             .expect("openpty");
-        let cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_noviewlog-tui"));
+        let mut cmd = CommandBuilder::new(env!("CARGO_BIN_EXE_noviewlog-tui"));
+        // Agent/CI shells often set `NO_COLOR=1`; crossterm then emits no
+        // SGR colors and this suite cannot see the selection highlight.
+        // The product still honors NO_COLOR for real users — only the child
+        // under test must paint colors.
+        cmd.env_remove("NO_COLOR");
+        // Agent shells may also set TERM=dumb; give the child a real VT TERM.
+        cmd.env("TERM", "xterm-256color");
         let child = pair.slave.spawn_command(cmd).expect("spawn noviewlog-tui");
         let mut reader = pair.master.try_clone_reader().expect("pty reader");
         let raw = Arc::new(Mutex::new(Vec::new()));
@@ -136,15 +143,28 @@ struct Scene {
 /// Spawn the TUI, wait for the running shell, echo a unique sentinel and
 /// locate its output row on the grid.
 fn scene_with_echoed_sentinel() -> Scene {
-    let mut tui = Tui::spawn();
-    let running = tui.pump(
-        |grid| {
-            grid.iter()
-                .any(|l| row_text(l).to_lowercase().contains("running"))
-        },
-        15,
-    );
-    assert!(running, "TUI must reach the running state");
+    // After other ConPTY suites in the full slow tier, the first spawn can
+    // miss the 15s "running" window (conhost cold start). Retry a few times
+    // with a longer pump before failing the harness.
+    let mut tui = None;
+    for attempt in 1..=3 {
+        let mut candidate = Tui::spawn();
+        let running = candidate.pump(
+            |grid| {
+                grid.iter()
+                    .any(|l| row_text(l).to_lowercase().contains("running"))
+            },
+            30,
+        );
+        if running {
+            tui = Some(candidate);
+            break;
+        }
+        eprintln!("conpty scene: running state miss on attempt {attempt}/3");
+        drop(candidate);
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    let mut tui = tui.expect("TUI must reach the running state");
     let sentinel = format!(
         "NVL{}{}",
         std::process::id(),
@@ -315,13 +335,18 @@ fn drag_selects_exact_span() {
     let k = scene.sentinel.chars().count() / 2;
     let (row, col) = (scene.row, scene.col);
     drag_select(&mut scene.tui, row, col, k);
-    // Settle: the injected events are queued synchronously; wait until the
-    // TUI has processed the release so the final (not mid-drag) frame is
-    // asserted. Live drag frames may still show the un-fixed EOL stretch.
-    std::thread::sleep(Duration::from_millis(500));
+    // Wait for a post-release frame that carries the kept highlight (live
+    // drag frames may still show the un-fixed EOL stretch).
+    let appeared = scene.tui.pump(
+        |grid| {
+            grid.get(row)
+                .is_some_and(|line| cell_bgs(line).contains(&Some(SELECTION_BG)))
+        },
+        3,
+    );
     let grid = scene.tui.grid();
     assert!(
-        cell_bgs(&grid[row]).contains(&Some(SELECTION_BG)),
+        appeared,
         "no selection highlight appeared at all (row {row} text: {:?})",
         row_text(&grid[row])
     );

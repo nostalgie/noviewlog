@@ -1,0 +1,247 @@
+// VS Code–style floating find bar over the log viewport.
+// Do not import app.slint (circular). Path icons only — never Unicode arrows/×.
+
+import { Theme } from "theme.slint";
+import { ModeToggle } from "chrome-menus.slint";
+
+export component FindBar inherits FocusScope {
+    in-out property <bool> find-open: false;
+    in-out property <string> find-query: "";
+    in-out property <bool> find-case-sensitive: false;
+    in-out property <bool> find-whole-word: false;
+    in-out property <bool> find-regex: false;
+    in-out property <string> find-status: "";
+    in-out property <string> find-error: "";
+    in-out property <bool> find-focus-request: false;
+
+    callback find-query-changed(query: string, regex: bool, case-sensitive: bool, whole-word: bool);
+    callback find-goto(direction: int);
+    callback find-commit();
+    callback find-closed();
+    /// Esc / close button: host should focus the log viewport.
+    callback request-viewport-focus();
+
+    // Geometry (x/y/width) is set by the host — component roots cannot bind `parent`.
+    // Use visible (not `if`) so the TextInput is not recreated on open/close.
+    // FocusScope keeps clicks on toggles/buttons from bouncing focus solely
+    // through the viewport FocusScope in a way that drops TextInput edits.
+    height: 34px;
+    visible: root.find-open;
+    enabled: root.find-open;
+    focus-on-click: true;
+
+    // Mirror root flag so Ctrl+F can re-focus while already open.
+    property <bool> want-focus: root.find-focus-request;
+    changed want-focus => {
+        if (self.want-focus && root.find-open) {
+            find-input.focus();
+            root.find-focus-request = false;
+        }
+    }
+    changed visible => {
+        if (self.visible) {
+            find-input.focus();
+        }
+    }
+
+    function emit-query-changed() {
+        root.find-query-changed(
+            root.find-query,
+            root.find-regex,
+            root.find-case-sensitive,
+            root.find-whole-word,
+        );
+    }
+
+    function close-find() {
+        root.find-open = false;
+        root.find-closed();
+        root.request-viewport-focus();
+    }
+
+    Rectangle {
+        width: 100%;
+        height: 100%;
+        border-radius: 0px;
+        background: Theme.bg-panel;
+        border-width: 1px;
+        border-color: Theme.border;
+        drop-shadow-color: Theme.shadow-panel;
+        drop-shadow-offset-y: 4px;
+        drop-shadow-blur: 12px;
+
+        HorizontalLayout {
+            padding-left: 6px;
+            padding-right: 4px;
+            spacing: 4px;
+            alignment: center;
+
+            Rectangle {
+                horizontal-stretch: 1;
+                height: 26px;
+                border-radius: 0px;
+                background: Theme.bg-input;
+                border-width: 1px;
+                border-color: Theme.border;
+
+                HorizontalLayout {
+                    padding-left: 6px;
+                    padding-right: 2px;
+                    spacing: 2px;
+                    alignment: center;
+
+                    input-slot := Rectangle {
+                        horizontal-stretch: 1;
+                        min-width: 80px;
+                        height: 100%;
+                        background: transparent;
+                        clip: true;
+
+                        // TextInput has no placeholder-text — paint hint when empty.
+                        if root.find-query == "": Text {
+                            width: 100%;
+                            height: 100%;
+                            text: "Find (Enter to next)";
+                            color: Theme.text-muted;
+                            font-size: 12px;
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+
+                        find-input := TextInput {
+                            width: 100%;
+                            height: 100%;
+                            text <=> root.find-query;
+                            font-size: 12px;
+                            color: Theme.text-primary;
+                            horizontal-alignment: left;
+                            vertical-alignment: center;
+                            selection-background-color: Theme.selection-bg;
+                            selection-foreground-color: Theme.selection-fg;
+                            single-line: true;
+                            edited => {
+                                root.find-query = self.text;
+                                root.emit-query-changed();
+                            }
+                            // Commit pending search when leaving the field
+                            // (click toggle / viewport) so stats cannot
+                            // overwrite typed text with a stale empty query.
+                            changed has-focus => {
+                                if (!self.has-focus && root.find-open) {
+                                    root.find-commit();
+                                }
+                            }
+                            accepted => {
+                                root.find-goto(1);
+                            }
+                            key-pressed(event) => {
+                                if (event.text == "\u{1b}") {
+                                    root.close-find();
+                                    accept
+                                } else if (event.text == "\n" && event.modifiers.shift) {
+                                    // Shift+Enter → previous match (VS Code).
+                                    root.find-goto(-1);
+                                    accept
+                                } else {
+                                    reject
+                                }
+                            }
+                        }
+                    }
+
+                    ModeToggle {
+                        label: "Aa";
+                        tip: "Match Case";
+                        active <=> root.find-case-sensitive;
+                        toggled(_) => { root.emit-query-changed(); }
+                    }
+                    ModeToggle {
+                        label: "ab";
+                        tip: "Match Whole Word";
+                        active <=> root.find-whole-word;
+                        toggled(_) => { root.emit-query-changed(); }
+                    }
+                    ModeToggle {
+                        label: ".*";
+                        tip: "Use Regular Expression";
+                        active <=> root.find-regex;
+                        toggled(_) => { root.emit-query-changed(); }
+                    }
+                }
+            }
+
+            Text {
+                text: root.find-error != "" ? root.find-error : root.find-status;
+                color: root.find-error != "" ? Theme.danger : Theme.text-secondary;
+                font-size: 11px;
+                vertical-alignment: center;
+                min-width: 56px;
+                horizontal-alignment: right;
+                overflow: elide;
+            }
+
+            TouchArea {
+                width: 22px;
+                height: 22px;
+                mouse-cursor: pointer;
+                clicked => { root.find-goto(-1); }
+                // Path up arrow — never Unicode ↑.
+                Path {
+                    x: (parent.width - 10px) / 2;
+                    y: (parent.height - 10px) / 2;
+                    width: 10px;
+                    height: 10px;
+                    stroke: parent.has-hover ? Theme.text-primary : Theme.text-secondary;
+                    stroke-width: 1.25px;
+                    fill: transparent;
+                    viewbox-x: 0;
+                    viewbox-y: 0;
+                    viewbox-width: 10;
+                    viewbox-height: 10;
+                    commands: "M 5 1.5 L 5 8.5 M 2 4.5 L 5 1.5 L 8 4.5";
+                }
+            }
+            TouchArea {
+                width: 22px;
+                height: 22px;
+                mouse-cursor: pointer;
+                clicked => { root.find-goto(1); }
+                // Path down arrow — never Unicode ↓.
+                Path {
+                    x: (parent.width - 10px) / 2;
+                    y: (parent.height - 10px) / 2;
+                    width: 10px;
+                    height: 10px;
+                    stroke: parent.has-hover ? Theme.text-primary : Theme.text-secondary;
+                    stroke-width: 1.25px;
+                    fill: transparent;
+                    viewbox-x: 0;
+                    viewbox-y: 0;
+                    viewbox-width: 10;
+                    viewbox-height: 10;
+                    commands: "M 5 1.5 L 5 8.5 M 2 5.5 L 5 8.5 L 8 5.5";
+                }
+            }
+            TouchArea {
+                width: 22px;
+                height: 22px;
+                mouse-cursor: pointer;
+                clicked => { root.close-find(); }
+                // Path close — never Unicode ×.
+                Path {
+                    x: (parent.width - 10px) / 2;
+                    y: (parent.height - 10px) / 2;
+                    width: 10px;
+                    height: 10px;
+                    stroke: parent.has-hover ? Theme.text-primary : Theme.text-muted;
+                    stroke-width: 1.25px;
+                    viewbox-x: 0;
+                    viewbox-y: 0;
+                    viewbox-width: 10;
+                    viewbox-height: 10;
+                    commands: "M 0.5 0.5 L 9.5 9.5 M 9.5 0.5 L 0.5 9.5";
+                }
+            }
+        }
+    }
+}

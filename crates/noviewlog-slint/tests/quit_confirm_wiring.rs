@@ -8,6 +8,11 @@ fn app_slint() -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+fn app_dialogs_slint() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("ui/app-dialogs.slint");
+    fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+}
+
 fn main_rs() -> String {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/main.rs");
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
@@ -16,20 +21,25 @@ fn main_rs() -> String {
 #[test]
 fn quit_overlay_uses_form_dialog_and_hide() {
     let src = app_slint();
+    let dialogs = app_dialogs_slint();
     assert!(
         src.contains("public function open-quit-confirm()"),
         "Rust must be able to show the quit overlay"
     );
     assert!(
-        src.contains("title: \"Close NoViewLog?\""),
+        src.contains("QuitConfirmDialog"),
+        "quit PopupWindow must host QuitConfirmDialog"
+    );
+    assert!(
+        dialogs.contains("title: \"Close NoViewLog?\""),
         "quit overlay title copy"
     );
     assert!(
-        src.contains("Running terminals will stop. Project settings stay saved."),
+        dialogs.contains("Running terminals will stop. Project settings stay saved."),
         "quit overlay body copy"
     );
     assert!(
-        src.contains("ok-text: \"Close\""),
+        dialogs.contains("ok-text: \"Close\""),
         "primary action is Close"
     );
     let confirm = src.find("function confirm-quit()").expect("confirm-quit");

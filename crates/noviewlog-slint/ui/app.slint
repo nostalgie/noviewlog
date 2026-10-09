@@ -5,7 +5,7 @@
 // (gap only), double-click maximize, thin winit resize-border.
 // Native MenuBar is not used — Slint forces it above Window body children.
 
-import { Palette, SpinBox } from "std-widgets.slint";
+import { Palette } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { TabInfo, TerminalInfo, FilterInfo, ProjectInfo } from "types.slint";
 import { CtxAccelMenuItem, ModeToggle } from "chrome-menus.slint";
@@ -19,8 +19,14 @@ import {
     SidebarSectionHeader,
     EngineScrollBar,
 } from "sidebar.slint";
-import { FormTextField, FormCheckField, FormDialogPanel } from "form-dialogs.slint";
 import { ProjectsDialog } from "projects-dialog.slint";
+import { FindBar } from "find-bar.slint";
+import {
+    EditLaunchDialog,
+    SettingsDialog,
+    AboutDialog,
+    QuitConfirmDialog,
+} from "app-dialogs.slint";
 
 // Bundled proportional UI face (OFL) — matches Linux Noto look on Windows.
 // NOT Mono: never use NotoSansMono / Cascadia Mono for chrome text.
@@ -1638,249 +1644,25 @@ export component AppWindow inherits Window {
                                         }
 
                                         // VS Code–style find bar (after TouchArea so it receives clicks).
-                                        // Use visible (not `if`) so the TextInput is not recreated on open/close.
-                                        // FocusScope keeps clicks on toggles/buttons from bouncing focus solely
-                                        // through the viewport FocusScope in a way that drops TextInput edits.
-                                        find-bar := FocusScope {
+                                        find-bar := FindBar {
                                             x: parent.width - self.width - 10px;
                                             y: 8px;
                                             width: min(420px, parent.width - 20px);
-                                            height: 34px;
-                                            visible: root.find-open;
-                                            enabled: root.find-open;
-                                            focus-on-click: true;
-
-                                            // Mirror root flag so Ctrl+F can re-focus while already open.
-                                            property <bool> want-focus: root.find-focus-request;
-                                            changed want-focus => {
-                                                if (self.want-focus && root.find-open) {
-                                                    find-input.focus();
-                                                    root.find-focus-request = false;
-                                                }
+                                            find-open <=> root.find-open;
+                                            find-query <=> root.find-query;
+                                            find-case-sensitive <=> root.find-case-sensitive;
+                                            find-whole-word <=> root.find-whole-word;
+                                            find-regex <=> root.find-regex;
+                                            find-status <=> root.find-status;
+                                            find-error <=> root.find-error;
+                                            find-focus-request <=> root.find-focus-request;
+                                            find-query-changed(q, regex, case-sensitive, whole-word) => {
+                                                root.find-query-changed(q, regex, case-sensitive, whole-word);
                                             }
-                                            changed visible => {
-                                                if (self.visible) {
-                                                    find-input.focus();
-                                                }
-                                            }
-
-                                            Rectangle {
-                                                width: 100%;
-                                                height: 100%;
-                                                border-radius: 0px;
-                                                background: Theme.bg-panel;
-                                                border-width: 1px;
-                                                border-color: Theme.border;
-                                                drop-shadow-color: Theme.shadow-panel;
-                                                drop-shadow-offset-y: 4px;
-                                                drop-shadow-blur: 12px;
-
-                                                HorizontalLayout {
-                                                    padding-left: 6px;
-                                                    padding-right: 4px;
-                                                    spacing: 4px;
-                                                    alignment: center;
-
-                                                    Rectangle {
-                                                        horizontal-stretch: 1;
-                                                        height: 26px;
-                                                        border-radius: 0px;
-                                                        background: Theme.bg-input;
-                                                        border-width: 1px;
-                                                        border-color: Theme.border;
-
-                                                        HorizontalLayout {
-                                                            padding-left: 6px;
-                                                            padding-right: 2px;
-                                                            spacing: 2px;
-                                                            alignment: center;
-
-                                                            input-slot := Rectangle {
-                                                                horizontal-stretch: 1;
-                                                                min-width: 80px;
-                                                                height: 100%;
-                                                                background: transparent;
-                                                                clip: true;
-
-                                                                // TextInput has no placeholder-text — paint hint when empty.
-                                                                if root.find-query == "": Text {
-                                                                    width: 100%;
-                                                                    height: 100%;
-                                                                    text: "Find (Enter to next)";
-                                                                    color: Theme.text-muted;
-                                                                    font-size: 12px;
-                                                                    vertical-alignment: center;
-                                                                    overflow: elide;
-                                                                }
-
-                                                                find-input := TextInput {
-                                                                    width: 100%;
-                                                                    height: 100%;
-                                                                    text <=> root.find-query;
-                                                                    font-size: 12px;
-                                                                    color: Theme.text-primary;
-                                                                    horizontal-alignment: left;
-                                                                    vertical-alignment: center;
-                                                                    selection-background-color: Theme.selection-bg;
-                                                                    selection-foreground-color: Theme.selection-fg;
-                                                                    single-line: true;
-                                                                    edited => {
-                                                                        root.find-query = self.text;
-                                                                        root.find-query-changed(
-                                                                            root.find-query,
-                                                                            root.find-regex,
-                                                                            root.find-case-sensitive,
-                                                                            root.find-whole-word,
-                                                                        );
-                                                                    }
-                                                                    // Commit pending search when leaving the field
-                                                                    // (click toggle / viewport) so stats cannot
-                                                                    // overwrite typed text with a stale empty query.
-                                                                    changed has-focus => {
-                                                                        if (!self.has-focus && root.find-open) {
-                                                                            root.find-commit();
-                                                                        }
-                                                                    }
-                                                                    accepted => {
-                                                                        root.find-goto(1);
-                                                                    }
-                                                                    key-pressed(event) => {
-                                                                        if (event.text == "\u{1b}") {
-                                                                            root.find-open = false;
-                                                                            root.find-closed();
-                                                                            viewport-host.focus();
-                                                                            accept
-                                                                        } else if (event.text == "\n" && event.modifiers.shift) {
-                                                                            // Shift+Enter → previous match (VS Code).
-                                                                            root.find-goto(-1);
-                                                                            accept
-                                                                        } else {
-                                                                            reject
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-
-                                                            ModeToggle {
-                                                                label: "Aa";
-                                                                tip: "Match Case";
-                                                                active <=> root.find-case-sensitive;
-                                                                toggled(_) => {
-                                                                    root.find-query-changed(
-                                                                        root.find-query,
-                                                                        root.find-regex,
-                                                                        root.find-case-sensitive,
-                                                                        root.find-whole-word,
-                                                                    );
-                                                                }
-                                                            }
-                                                            ModeToggle {
-                                                                label: "ab";
-                                                                tip: "Match Whole Word";
-                                                                active <=> root.find-whole-word;
-                                                                toggled(_) => {
-                                                                    root.find-query-changed(
-                                                                        root.find-query,
-                                                                        root.find-regex,
-                                                                        root.find-case-sensitive,
-                                                                        root.find-whole-word,
-                                                                    );
-                                                                }
-                                                            }
-                                                            ModeToggle {
-                                                                label: ".*";
-                                                                tip: "Use Regular Expression";
-                                                                active <=> root.find-regex;
-                                                                toggled(_) => {
-                                                                    root.find-query-changed(
-                                                                        root.find-query,
-                                                                        root.find-regex,
-                                                                        root.find-case-sensitive,
-                                                                        root.find-whole-word,
-                                                                    );
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-
-                                                    Text {
-                                                        text: root.find-error != "" ? root.find-error : root.find-status;
-                                                        color: root.find-error != "" ? Theme.danger : Theme.text-secondary;
-                                                        font-size: 11px;
-                                                        vertical-alignment: center;
-                                                        min-width: 56px;
-                                                        horizontal-alignment: right;
-                                                        overflow: elide;
-                                                    }
-
-                                                    TouchArea {
-                                                        width: 22px;
-                                                        height: 22px;
-                                                        mouse-cursor: pointer;
-                                                        clicked => { root.find-goto(-1); }
-                                                        // Path up arrow — never Unicode ↑.
-                                                        Path {
-                                                            x: (parent.width - 10px) / 2;
-                                                            y: (parent.height - 10px) / 2;
-                                                            width: 10px;
-                                                            height: 10px;
-                                                            stroke: parent.has-hover ? Theme.text-primary : Theme.text-secondary;
-                                                            stroke-width: 1.25px;
-                                                            fill: transparent;
-                                                            viewbox-x: 0;
-                                                            viewbox-y: 0;
-                                                            viewbox-width: 10;
-                                                            viewbox-height: 10;
-                                                            commands: "M 5 1.5 L 5 8.5 M 2 4.5 L 5 1.5 L 8 4.5";
-                                                        }
-                                                    }
-                                                    TouchArea {
-                                                        width: 22px;
-                                                        height: 22px;
-                                                        mouse-cursor: pointer;
-                                                        clicked => { root.find-goto(1); }
-                                                        // Path down arrow — never Unicode ↓.
-                                                        Path {
-                                                            x: (parent.width - 10px) / 2;
-                                                            y: (parent.height - 10px) / 2;
-                                                            width: 10px;
-                                                            height: 10px;
-                                                            stroke: parent.has-hover ? Theme.text-primary : Theme.text-secondary;
-                                                            stroke-width: 1.25px;
-                                                            fill: transparent;
-                                                            viewbox-x: 0;
-                                                            viewbox-y: 0;
-                                                            viewbox-width: 10;
-                                                            viewbox-height: 10;
-                                                            commands: "M 5 1.5 L 5 8.5 M 2 5.5 L 5 8.5 L 8 5.5";
-                                                        }
-                                                    }
-                                                    TouchArea {
-                                                        width: 22px;
-                                                        height: 22px;
-                                                        mouse-cursor: pointer;
-                                                        clicked => {
-                                                            root.find-open = false;
-                                                            root.find-closed();
-                                                            viewport-host.focus();
-                                                        }
-                                                        // Path close — never Unicode ×.
-                                                        Path {
-                                                            x: (parent.width - 10px) / 2;
-                                                            y: (parent.height - 10px) / 2;
-                                                            width: 10px;
-                                                            height: 10px;
-                                                            stroke: parent.has-hover ? Theme.text-primary : Theme.text-muted;
-                                                            stroke-width: 1.25px;
-                                                            viewbox-x: 0;
-                                                            viewbox-y: 0;
-                                                            viewbox-width: 10;
-                                                            viewbox-height: 10;
-                                                            commands: "M 0.5 0.5 L 9.5 9.5 M 9.5 0.5 L 0.5 9.5";
-                                                        }
-                                                    }
-                                                }
-                                            }
+                                            find-goto(direction) => { root.find-goto(direction); }
+                                            find-commit => { root.find-commit(); }
+                                            find-closed => { root.find-closed(); }
+                                            request-viewport-focus => { viewport-host.focus(); }
                                         }
 
                                         changed width => {
@@ -2038,80 +1820,15 @@ export component AppWindow inherits Window {
         width: Theme.overlay-width;
         close-policy: close-on-click-outside;
 
-        edit-launch-panel := FormDialogPanel {
-            title: "Edit launch";
-            ok-text: "Save";
-            width: 100%;
+        edit-launch-panel := EditLaunchDialog {
+            host-is-windows: root.host-is-windows;
+            command-draft <=> root.launch-command-draft;
+            args-draft <=> root.launch-args-draft;
+            cwd-draft <=> root.launch-cwd-draft;
+            wsl-draft <=> root.launch-wsl-draft;
+            wsl-distro-draft <=> root.launch-wsl-distro-draft;
             cancelled => { edit-launch-dlg.close(); }
             confirmed => { root.confirm-edit-launch(); }
-
-            launch-command-field := FormTextField {
-                label: "Command (empty = interactive shell)";
-                text <=> root.launch-command-draft;
-                focus-on-init: true;
-                accepted => { root.confirm-edit-launch(); }
-                cancelled => { edit-launch-dlg.close(); }
-                tab-move(shift) => {
-                    if (shift) { launch-cwd-field.take-focus(); }
-                    else { launch-args-field.take-focus(); }
-                }
-            }
-            launch-args-field := FormTextField {
-                label: "Args (space-separated)";
-                text <=> root.launch-args-draft;
-                accepted => { root.confirm-edit-launch(); }
-                cancelled => { edit-launch-dlg.close(); }
-                tab-move(shift) => {
-                    if (shift) { launch-command-field.take-focus(); }
-                    else {
-                        // Forward into the distro field when it is visible.
-                        if (root.host-is-windows && root.launch-wsl-draft) {
-                            launch-wsl-distro-field.take-focus();
-                        } else {
-                            launch-cwd-field.take-focus();
-                        }
-                    }
-                }
-            }
-            if root.host-is-windows: FormCheckField {
-                label: "Run in WSL";
-                checked <=> root.launch-wsl-draft;
-            }
-            // `visible`, not `if`: the id must stay reachable from the
-            // neighbouring fields' tab-move handlers, and invisible elements
-            // occupy no layout space anyway.
-            launch-wsl-distro-field := FormTextField {
-                visible: root.host-is-windows && root.launch-wsl-draft;
-                label: "WSL distro (empty = default)";
-                text <=> root.launch-wsl-distro-draft;
-                accepted => { root.confirm-edit-launch(); }
-                cancelled => { edit-launch-dlg.close(); }
-                tab-move(shift) => {
-                    if (shift) { launch-args-field.take-focus(); }
-                    else { launch-cwd-field.take-focus(); }
-                }
-            }
-            launch-cwd-field := FormTextField {
-                label: root.host-is-windows && root.launch-wsl-draft
-                    ? "Working directory (Linux path, e.g. /home/...)"
-                    : "Working directory";
-                text <=> root.launch-cwd-draft;
-                accepted => { root.confirm-edit-launch(); }
-                cancelled => { edit-launch-dlg.close(); }
-                tab-move(shift) => {
-                    if (shift) {
-                        // Include the distro field only while it is visible,
-                        // otherwise Shift+Tab from cwd skips back to args.
-                        if (root.host-is-windows && root.launch-wsl-draft) {
-                            launch-wsl-distro-field.take-focus();
-                        } else {
-                            launch-args-field.take-focus();
-                        }
-                    } else {
-                        launch-command-field.take-focus();
-                    }
-                }
-            }
         }
     }
 
@@ -2122,35 +1839,10 @@ export component AppWindow inherits Window {
         width: Theme.overlay-width;
         close-policy: close-on-click-outside;
 
-        settings-panel := FormDialogPanel {
-            title: "Settings";
-            ok-text: "OK";
-            width: 100%;
+        settings-panel := SettingsDialog {
+            settings-draft <=> root.settings-draft;
             cancelled => { root.close-settings(); }
             confirmed => { root.confirm-settings(); }
-
-            VerticalLayout {
-                spacing: 6px;
-                width: 100%;
-                Text {
-                    text: "Max scrollback lines";
-                    color: Theme.text-muted;
-                    font-size: 11px;
-                    font-weight: 700;
-                }
-                SpinBox {
-                    minimum: 100;
-                    maximum: 30000;
-                    step-size: 1000;
-                    value <=> root.settings-draft;
-                }
-                Text {
-                    text: "Oldest lines are dropped when the limit is exceeded (100–30000).";
-                    color: Theme.text-secondary;
-                    font-size: 11px;
-                    wrap: word-wrap;
-                }
-            }
         }
     }
 
@@ -2163,78 +1855,12 @@ export component AppWindow inherits Window {
         width: Theme.overlay-width;
         close-policy: close-on-click-outside;
 
-        about-panel := FormDialogPanel {
-            title: "About";
-            ok-text: "OK";
-            show-cancel: false;
-            width: 100%;
+        about-panel := AboutDialog {
             cancelled => { root.close-about(); }
             confirmed => { root.close-about(); }
-
-            HorizontalLayout {
-                spacing: 12px;
-                alignment: start;
-
-                Image {
-                    source: @image-url("assets/icon.png");
-                    width: 32px;
-                    height: 32px;
-                    image-fit: contain;
-                }
-
-                VerticalLayout {
-                    spacing: 4px;
-                    alignment: center;
-                    Text {
-                        text: "NoViewLog";
-                        color: Theme.text-primary;
-                        font-size: 16px;
-                        font-weight: 700;
-                    }
-                    Text {
-                        text: "Native desktop log viewer";
-                        color: Theme.text-secondary;
-                        font-size: 12px;
-                    }
-                }
-            }
-
-            HorizontalLayout {
-                spacing: 0px;
-                alignment: start;
-
-                Text {
-                    text: "UI built with Slint — see ";
-                    color: Theme.text-muted;
-                    font-size: 11px;
-                    wrap: no-wrap;
-                }
-
-                Rectangle {
-                    horizontal-stretch: 0;
-                    VerticalLayout {
-                        spacing: 1px;
-                        Text {
-                            text: "slint.dev";
-                            color: slint-link.has-hover ? Theme.text-primary : Theme.text-secondary;
-                            font-size: 11px;
-                            wrap: no-wrap;
-                        }
-                        Rectangle {
-                            height: 1px;
-                            background: slint-link.has-hover ? Theme.text-primary : Theme.text-secondary;
-                        }
-                    }
-                    slint-link := TouchArea {
-                        width: 100%;
-                        height: 100%;
-                        mouse-cursor: pointer;
-                        clicked => {
-                            root.open-url("https://slint.dev");
-                            root.close-about();
-                        }
-                    }
-                }
+            open-slint-site => {
+                root.open-url("https://slint.dev");
+                root.close-about();
             }
         }
     }
@@ -2245,21 +1871,9 @@ export component AppWindow inherits Window {
         width: Theme.overlay-width;
         close-policy: close-on-click-outside;
 
-        quit-panel := FormDialogPanel {
-            title: "Close NoViewLog?";
-            ok-text: "Close";
-            cancel-text: "Cancel";
-            footer-start: true;
-            width: 100%;
+        quit-panel := QuitConfirmDialog {
             cancelled => { root.close-quit-confirm(); }
             confirmed => { root.confirm-quit(); }
-
-            Text {
-                text: "Running terminals will stop. Project settings stay saved.";
-                color: Theme.text-secondary;
-                font-size: 12px;
-                wrap: word-wrap;
-            }
         }
     }
 }

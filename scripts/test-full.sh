@@ -12,6 +12,9 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 export PATH="$HOME/.cargo/bin:$PATH"
+# Agent/CI shells may export NO_COLOR=1; crossterm then strips SGR and
+# color-asserting slow-tier TUI tests fail. Full suite needs real colors.
+unset NO_COLOR || true
 
 FULL=0
 [ "${1:-}" = "--full" ] && FULL=1
@@ -27,11 +30,11 @@ echo "=== cargo test --workspace (fast tier)"
 cargo test --workspace
 
 if [ "$FULL" -eq 1 ]; then
-    # Serial: the ignored tier includes ConPTY e2e suites that share the real
-    # system clipboard — parallel runs pollute each other's assertions
-    # (the suite headers mandate --test-threads=1).
-    echo "=== slow tier (-- --ignored --test-threads=1)"
-    cargo test --workspace -- --ignored --test-threads=1
+    # Serial across packages (-j1) and within each harness (--test-threads=1):
+    # ConPTY e2e suites share the real system clipboard and contend for PTY
+    # slots; parallel harnesses flake on "TUI must reach the running state".
+    echo "=== slow tier (-j1 -- --ignored --test-threads=1)"
+    cargo test --workspace -j1 -- --ignored --test-threads=1
 fi
 
 echo "FULL TESTS: OK"
